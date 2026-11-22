@@ -1,4 +1,4 @@
-module github.com/youruser/rclone-posixmeta
+module github.com/mspeder/rclone-posixmeta
 
 go 1.27.4
 
