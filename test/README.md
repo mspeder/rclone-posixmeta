@@ -123,7 +123,10 @@ Useful helpers from `test/lib/harness.sh`:
   the `PM_CFG_OPTS` associative array;
 * mounts: `pm_mount_start`, `pm_mount_stop` (also run automatically on exit),
   `pm_assert_mount_has_no_sidecars`; posixmeta mounts must pass
-  `--metadata-push` (see `_mount_start` in `02-mount-crypt.sh`);
+  `--metadata-push` and pass `--vfs-links` to enable symlinks (see
+  `_mount_start` in `02-mount-crypt.sh`). `--metadata-push` is enforced by a
+  backend preflight; `--vfs-links` is intentionally optional and its absence
+  is covered by a negative test;
 * control flow: `skip "reason"`, `xfail "reason"`.
 
 Tests must be independent: each runs in its own child process and scratch
@@ -134,10 +137,19 @@ Subpath semantics (`pm:subdir`) are covered explicitly: the backend mirrors
 `moveto`, `rmdir`, `purge`, and `lsjson --metadata pm:dir/file` keep directory
 sidecars and parent-owner inheritance intact.
 
-## Current known gaps (XFAIL)
+## FUSE symlinks
 
-* **FUSE symlinks** — `ln -s`/`readlink` are not wired through the mount even
-  though the backend stores the `symlink` sidecar attribute (roadmap item 2).
+Symlinks use upstream rclone's `.rclonelink` model and are enabled with
+`--vfs-links` (or the global `--links`). A link is a single backend object
+whose payload is the target; no `.posixmeta` sidecar is created unless metadata
+is explicitly pushed. `--vfs-links` is opt-in and has no mount preflight:
+without it `ln -s`/`readlink` fail loudly and nothing is silently lost.
+
+Covered by `test_mount_symlinks_via_vfs_links` (relative/absolute/dangling
+links, symlink type and `--link-perms` mode, inherited uid/gid, backend
+`.rclonelink` payload, absence of a sidecar, rename, delete and remount) and
+`test_mount_without_vfs_links_rejects_symlink` (opt-in failure leaves no object
+behind). See `docs/adr/0002-fuse-symlinks-via-vfs-links.md`.
 
 FUSE `chmod`/`chown`/`stat` propagation is implemented in the local rclone fork
 (`third_party/rclone`) and is **opt-in** via `--metadata-push`; without the flag

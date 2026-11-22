@@ -19,9 +19,11 @@ _mount_setup() {
 _mount_start() {
 	pm_mount_start pm: "$PM_MNT" \
 		--metadata-push \
+		--vfs-links \
 		--vfs-cache-mode writes \
 		--vfs-write-back 200ms \
-		--dir-cache-time 500ms
+		--dir-cache-time 500ms \
+		"$@"
 }
 
 test_mount_roundtrip_metadata_inheritance_and_encryption() {
@@ -237,15 +239,114 @@ test_mount_getattr_reflects_sidecar_metadata() {
 	pm_mount_stop "$PM_MNT"
 }
 
-# Known gap from AGENTS.md roadmap item 2: symlinks are not wired through the
-# VFS mount even though the backend persists the "symlink" sidecar attribute.
-test_mount_symlink_via_fuse_is_forwarded() {
-	xfail "roadmap: rclone VFS does not implement symlink creation/readlink"
+# Upstream --vfs-links represents a symlink as a single <name>.rclonelink
+# object whose payload is the target. posixmeta (over crypt) stores that one
+# object like any other file, so no sidecar is created unless metadata is
+# explicitly pushed. --metadata-push must still keep the symlink mode from
+# --link-perms (plus the symlink type bit) instead of overlaying the
+# posixmeta default file mode, while uid/gid inheritance keeps working.
+test_mount_symlinks_via_vfs_links() {
 	_mount_setup
-	_mount_start
 
-	ln -s /etc/hostname "$PM_MNT/link"
-	pm_wait_meta pm: link symlink /etc/hostname 3
+	# Create the parent and its sidecar before mounting so uid/gid
+	# inheritance is read fresh by the mount process.
+	pm mkdir pm:dir
+	printf 'payload\n' >"$PM_IN/target.txt"
+	pm copyto "$PM_IN/target.txt" pm:dir/target.txt
+	pm backend setmeta pm: dir -o uid=1050 -o gid=1060 >/dev/null
+
+	_mount_start --umask 0000 --link-perms 0777
+
+	raw_before=$(find "$PM_SRC" -type f | wc -l | tr -d ' ')
+
+	ln -s target.txt "$PM_MNT/dir/rel-link"
+	ln -s /etc/hostname "$PM_MNT/dir/abs-link"
+	ln -s missing "$PM_MNT/dir/dangling"
+
+	pm_wait_entry pm:dir rel-link.rclonelink
+	pm_wait_entry pm:dir abs-link.rclonelink
+	pm_wait_entry pm:dir dangling.rclonelink
+
+	# The VFS publishes the object asynchronously after the writeback;
+	# wait until getattr resolves the inherited owner.
+	link_owner_resolved() { [[ $(stat -c '%u' "$1" 2>/dev/null) == 1050 ]]; }
+	pm_wait_for 10 link_owner_resolved "$PM_MNT/dir/rel-link"
+
+	# Mount view: symlink type and mode from --link-perms, not the 0644
+	# default stored/resolved for ordinary files.
+	pm_assert_eq "symbolic link" "$(stat -c '%F' "$PM_MNT/dir/rel-link")" "stat reports a symlink"
+	pm_assert_eq "777" "$(stat -c '%a' "$PM_MNT/dir/rel-link")" "symlink mode from --link-perms"
+	pm_assert_eq "1050" "$(stat -c '%u' "$PM_MNT/dir/rel-link")" "symlink inherits parent uid"
+	pm_assert_eq "1060" "$(stat -c '%g' "$PM_MNT/dir/rel-link")" "symlink inherits parent gid"
+	pm_assert_eq "target.txt" "$(readlink "$PM_MNT/dir/rel-link")" "relative readlink"
+	pm_assert_eq "/etc/hostname" "$(readlink "$PM_MNT/dir/abs-link")" "absolute readlink"
+	pm_assert_eq "missing" "$(readlink "$PM_MNT/dir/dangling")" "dangling readlink"
+	pm_assert_eq "payload" "$(cat "$PM_MNT/dir/rel-link")" "link resolves to its target"
+	pm_assert_no_file "$PM_MNT/dir/rel-link.rclonelink"
+	pm_assert_mount_has_no_sidecars "$PM_MNT"
+
+	# Backend view: one plain object per link, target as payload, and no
+	# posixmeta sidecar. lsjson reports the ordinary file default 0644:
+	# the 0777 above is presentation-only.
+	pm_assert_eq "target.txt" "$(pm cat pm:dir/rel-link.rclonelink)" "link payload on the backend"
+	pm_assert_eq "0644" "$(pm_meta_of pm:dir rel-link.rclonelink mode)" "backend default mode without a sidecar"
+	pm_assert_eq "1050" "$(pm_meta_of pm:dir rel-link.rclonelink uid)" "backend inherited uid"
+	pm_assert_eq "1060" "$(pm_meta_of pm:dir rel-link.rclonelink gid)" "backend inherited gid"
+	# lsjson hides sidecars, so count the encrypted objects on raw storage:
+	# exactly one new object per link, and no sidecar.
+	pm_assert_eq "$((raw_before + 3))" \
+		"$(find "$PM_SRC" -type f | wc -l | tr -d ' ')" \
+		"one raw object per symlink, no sidecar"
+	pm_assert_raw_has_no_plaintext rel-link
+
+	mv "$PM_MNT/dir/rel-link" "$PM_MNT/dir/renamed-link"
+	pm_wait_entry pm:dir renamed-link.rclonelink
+	pm_wait_entry_gone pm:dir rel-link.rclonelink
+	pm_assert_eq "target.txt" "$(readlink "$PM_MNT/dir/renamed-link")" "readlink survives rename"
+
+	rm "$PM_MNT/dir/abs-link" "$PM_MNT/dir/dangling"
+	pm_wait_entry_gone pm:dir abs-link.rclonelink
+	pm_wait_entry_gone pm:dir dangling.rclonelink
+
+	# Exactly one object for the remaining link plus the regular target.
+	pm_assert_eq "2" "$(pm lsjson pm:dir | jq 'length')" "one backend object per symlink"
+	pm_assert_eq "$((raw_before + 1))" \
+		"$(find "$PM_SRC" -type f | wc -l | tr -d ' ')" \
+		"deleted symlinks left no object or sidecar behind"
+
+	# The suffix translation must also work after a remount (listing path).
+	pm_mount_stop "$PM_MNT"
+	_mount_start
+	pm_assert_eq "target.txt" "$(readlink "$PM_MNT/dir/renamed-link")" "readlink survives remount"
+
+	pm_mount_stop "$PM_MNT"
+}
+
+# --vfs-links is deliberately opt-in (see docs/adr/0002). Without it symlink
+# creation fails loudly instead of silently misbehaving, no .rclonelink object
+# or sidecar is created, and ordinary files keep working.
+test_mount_without_vfs_links_rejects_symlink() {
+	_mount_setup
+	pm_mount_start pm: "$PM_MNT" \
+		--metadata-push \
+		--vfs-cache-mode writes \
+		--vfs-write-back 200ms \
+		--dir-cache-time 500ms
+
+	printf 'payload\n' >"$PM_MNT/plain.txt"
+	pm_wait_entry pm: plain.txt
+
+	if ln -s target "$PM_MNT/link" 2>/dev/null; then
+		pm_fail "ln -s unexpectedly succeeded without --vfs-links"
+	fi
+	if readlink "$PM_MNT/link" >/dev/null 2>&1; then
+		pm_fail "readlink unexpectedly succeeded without --vfs-links"
+	fi
+	pm_assert_eq "1" "$(pm lsjson pm: | jq 'length')" "failed symlink leaves no object behind"
+	pm_assert_eq "1" \
+		"$(find "$PM_SRC" -type f | wc -l | tr -d ' ')" \
+		"failed symlink leaves no raw object or sidecar"
+	pm_assert_eq "payload" "$(cat "$PM_MNT/plain.txt")" "regular I/O still works"
 
 	pm_mount_stop "$PM_MNT"
 }

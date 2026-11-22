@@ -20,6 +20,10 @@ committed**. Only the unified diff is versioned:
   `cmd/mount/dir.go`, `cmd/mountlib/mount.go`, plus new
   `cmd/mount/posixmeta.go`).
 
+The `cmd/mount` overlay skips the backend `mode` for symlink nodes (upstream
+`--link-perms`/`S_IFLNK` must win; see
+`docs/adr/0002-fuse-symlinks-via-vfs-links.md`) and still applies `uid`/`gid`.
+
 ### Materialise / refresh the fork
 
 ```bash

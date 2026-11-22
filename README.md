@@ -19,8 +19,15 @@ FUSE `chmod`/`chown` and report per-entry metadata from `stat` when the
 behaviour is unchanged for other backends):
 
 ```bash
-rclone-posixmeta mount pm: /mnt/pm --metadata-push --vfs-cache-mode writes
+rclone-posixmeta mount pm: /mnt/pm --metadata-push --vfs-links --vfs-cache-mode writes
 ```
+
+Symlinks use upstream rclone's `.rclonelink` model: add `--vfs-links` to store
+a link as one object holding the target (no `.posixmeta` sidecar), with
+`readlink`/`stat`/rename/delete handled by the VFS. The fork avoids overlaying
+the posixmeta default file mode on link nodes, so `--link-perms` applies while
+`uid`/`gid` inheritance still does. Without `--vfs-links`, `ln -s` fails
+loudly instead of silently degrading.
 
 `posixmeta` refuses to mount without `--metadata-push` rather than silently
 ignoring the stored `mode`/`uid`/`gid`.
@@ -28,6 +35,8 @@ ignoring the stored `mode`/`uid`/`gid`.
 * Architecture, invariants and test procedures: [`AGENTS.md`](AGENTS.md)
 * FUSE chmod/chown design decision:
   [`docs/adr/0001-fuse-chmod-chown-propagation.md`](docs/adr/0001-fuse-chmod-chown-propagation.md)
+* FUSE symlink design decision:
+  [`docs/adr/0002-fuse-symlinks-via-vfs-links.md`](docs/adr/0002-fuse-symlinks-via-vfs-links.md)
 * Test harness: [`test/README.md`](test/README.md)
 
 ## Build

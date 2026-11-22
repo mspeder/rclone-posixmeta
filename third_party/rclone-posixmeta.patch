@@ -457,15 +457,18 @@
  	"os"
  	"syscall"
  	"time"
-@@ -38,13 +39,24 @@
+@@ -38,13 +39,27 @@
  	a.Mtime = modTime
  	a.Ctime = modTime
  	a.Blocks = Blocks
 +	// Override the mount defaults with per-entry POSIX metadata if
 +	// --metadata-push was requested and the backend supports it.
++	// Symlinks keep the mode from --link-perms (0777 plus the symlink
++	// type bit) because the kernel ignores chmod on symlinks; only
++	// uid/gid are overlaid for them.
 +	if f.fsys.opt.MetadataPush {
 +		if meta, err := f.File.Metadata(ctx); err == nil {
-+			applyPOSIXMetadata(a, meta)
++			applyPOSIXMetadata(a, meta, !f.File.IsSymlink())
 +		}
 +	}
  	return nil
@@ -483,7 +486,7 @@
  func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) (err error) {
  	defer log.Trace(f, "a=%+v", req)("err=%v", &err)
  	if !f.VFS().Opt.NoModTime {
-@@ -57,6 +69,29 @@
+@@ -57,6 +72,29 @@
  	if req.Valid.Size() {
  		err = f.File.Truncate(int64(req.Size))
  	}
@@ -531,7 +534,7 @@
 +	// --metadata-push was requested and the backend supports it.
 +	if d.fsys.opt.MetadataPush {
 +		if meta, err := d.Dir.Metadata(ctx); err == nil {
-+			applyPOSIXMetadata(a, meta)
++			applyPOSIXMetadata(a, meta, true)
 +		}
 +	}
  	// FIXME include Valid so get some caching?
@@ -650,7 +653,7 @@
  			// Wait for foreground mount, if any...
 --- /dev/null
 +++ b/cmd/mount/posixmeta.go
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,72 @@
 +//go:build linux
 +
 +package mount
@@ -670,11 +673,17 @@
 +// This lets `ls -l` and `stat` inside the mount show the values stored
 +// by backends such as posixmeta instead of --file-perms/--dir-perms and
 +// --uid/--gid.
-+func applyPOSIXMetadata(attr *fuse.Attr, meta fs.Metadata) {
++//
++// modeFromMeta must be false for symlinks. Their mode comes from
++// --link-perms (0777 plus the symlink type bit) and the kernel ignores
++// chmod on symlinks, so applying a stored "mode" attribute would make
++// `stat` report e.g. 0644 for a link. uid/gid are still overlaid so
++// inherited owners are visible for links too.
++func applyPOSIXMetadata(attr *fuse.Attr, meta fs.Metadata, modeFromMeta bool) {
 +	if len(meta) == 0 {
 +		return
 +	}
-+	if v, ok := meta["mode"]; ok {
++	if v, ok := meta["mode"]; ok && modeFromMeta {
 +		if mode, ok := parsePOSIXMode(v); ok {
 +			const permBits = os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
 +			attr.Mode = (attr.Mode &^ permBits) | mode

@@ -45,7 +45,9 @@ When used for encrypted cloud FUSE mounts, the stack is ordered from bottom to t
     kernel `chmod`/`chown` to the node (silently ignored with ENOSYS when the
     backend doesn't support metadata). Both paths are gated on the
     `--metadata-push` mount option (default off) to preserve stock rclone
-    behaviour for `local`/`crypt`/cloud mounts.
+    behaviour for `local`/`crypt`/cloud mounts. Symlink nodes keep their mode
+    from `--link-perms` (`S_IFLNK` plus the link permissions) while `uid`/`gid`
+    are still overlaid.
   * `cmd/mountlib/`: `--metadata-push` option and a preflight that rejects a
     backend implementing `RequiresMetadataPush() bool` when the flag is
     absent; `posixmeta` returns true, so it cannot be mounted in a silently
@@ -55,7 +57,8 @@ When used for encrypted cloud FUSE mounts, the stack is ordered from bottom to t
   `test/suites/02-mount-crypt.sh` after any rclone version bump. A
   unified diff against pristine v1.76.0 is kept in
   `third_party/rclone-posixmeta.patch` (see also
-  `docs/adr/0001-fuse-chmod-chown-propagation.md`).
+  `docs/adr/0001-fuse-chmod-chown-propagation.md` and
+  `docs/adr/0002-fuse-symlinks-via-vfs-links.md`).
 
 ### Known Benign Log Message
 
@@ -96,6 +99,16 @@ Agents modifying `backend/posixmeta/posixmeta.go` **must** preserve the followin
    * `posixmeta` implements `RequiresMetadataPush() bool` returning true, so a
      mount without the flag fails fast with an actionable error instead of
      silently ignoring sidecars.
+8. **Symlinks via upstream `--vfs-links`:**
+   * A FUSE symlink is one `<name>.rclonelink` object whose payload is the
+     target (see `docs/adr/0002-fuse-symlinks-via-vfs-links.md`). No
+     `.posixmeta` sidecar is created for a plain link.
+   * For symlink nodes the mount must not overlay the backend `mode`
+     (`--link-perms`/`S_IFLNK` wins because Linux ignores `chmod` on links),
+     but must still overlay `uid`/`gid` so inheritance works.
+   * `--vfs-links` is deliberately opt-in and has no mount preflight: without
+     it `ln -s`/`readlink` fail loudly, and forcing it would reinterpret
+     literal `*.rclonelink` objects and break existing mounts.
 
 ## 4. Automated Verification Procedures
 
@@ -123,9 +136,8 @@ via traps, and reports `PASS`/`FAIL`/`SKIP`/`XFAIL`/`XPASS`.
 * Go unit tests: `backend/posixmeta/posixmeta_test.go`
 * Documentation: `test/README.md`
 
-Some tests are intentionally `XFAIL` while they document known gaps (FUSE
-symlinks — see Roadmap). `XPASS` means a gap appears fixed; make it fatal in CI
-with `--strict-xpass`, then remove the `xfail` call.
+No tests are currently `XFAIL`. `XPASS` means a test marked with `xfail` now
+passes: make it fatal in CI with `--strict-xpass`, then remove the `xfail` call.
 
 ### Procedure A: Non-Mount Unit/CLI Verification (Sidecars, Inheritance, Moves, Deletes)
 
@@ -232,6 +244,7 @@ EOF
 ./rclone-posixmeta --config "$CONF" mount pm_crypt: "$MNT" \
   --cache-dir "$VFS" \
   --metadata-push \
+  --vfs-links \
   --vfs-cache-mode writes \
   --vfs-write-back 200ms \
   --dir-cache-time 500ms \
@@ -309,6 +322,19 @@ if [[ -n $CHGID ]]; then
   echo "$META_MODE" | grep -q "\"gid\":\"$CHGID\""
 fi
 
+# 10. Verify symlinks via --vfs-links: one backend object holding the target,
+#     no sidecar, symlink type and inherited owner visible through getattr.
+RAW_BEFORE=$(find "$RAW" -type f | wc -l | tr -d ' ')
+ln -s mode.txt "$MNT/secret_dir/link.txt"
+sleep 1
+test -L "$MNT/secret_dir/link.txt"
+test "$(readlink "$MNT/secret_dir/link.txt")" = "mode.txt"
+test "$(stat -c '%F' "$MNT/secret_dir/link.txt")" = "symbolic link"
+test "$(stat -c '%u' "$MNT/secret_dir/link.txt")" = "1050"
+./rclone-posixmeta --config "$CONF" lsjson pm_crypt:secret_dir |
+  grep -q '"Name":"link.txt.rclonelink"'
+test "$(find "$RAW" -type f | wc -l | tr -d ' ')" = "$((RAW_BEFORE + 1))"
+
 echo "PASS: Procedure B (mount + crypt)"
 ```
 
@@ -353,14 +379,30 @@ Known limitations:
 * The `cmount`/`mount2` path (`cmd/cmount/`) is not patched; use `rclone mount`.
 * `chown` of the mount root is not propagated: the VFS root holds a synthetic
   directory entry with no backend counterpart.
-* `--links` symlinks remain roadmap item 2.
 * Metadata changed by another process is invisible until `cache_ttl` expires
   in the mount process (same as any backend cache).
 
-### 2. Symlink Support in FUSE Mount
+### 2. Symlink Support in FUSE Mount — Fixed
 
-* `backend/posixmeta/posixmeta.go` already stores and resolves `"symlink"` in `.posixmeta` sidecars (`sidecarData.Symlink`).
-* Next step: Inspect `vfs/` symlink handling (`Symlink`, `Readlink`, `--links`) and wire `ln -s` / `readlink` inside `rclone mount` to read/write `"symlink"` metadata on `posixmeta` objects when the wrapped remote does not natively support symlinks (such as `pcloud` or `crypt`).
+Uses the upstream `.rclonelink` model (design A in
+`docs/adr/0002-fuse-symlinks-via-vfs-links.md`):
+
+* Mount with `--vfs-links` (or the global `--links`). `ln -s` stores one
+  `<name>.rclonelink` object whose payload is the target; `readlink`, `stat`,
+  rename, delete and remount work through the VFS. No backend or rclone VFS
+  change was needed.
+* `posixmeta` over `crypt` keeps that as a single encrypted object: no
+  plaintext link name/target at rest and no `.posixmeta` sidecar for a plain
+  link.
+* The fork's `Attr` overlay skips `mode` for symlink nodes so `--link-perms`
+  (plus `S_IFLNK`) wins, while `uid`/`gid` (including parent-owner inheritance)
+  are still applied.
+* `--vfs-links` is opt-in with **no** mount preflight: without it `ln -s`
+  fails with `ENOSYS` rather than silently misbehaving. Covered by
+  `test_mount_without_vfs_links_rejects_symlink` and
+  `test_mount_symlinks_via_vfs_links`.
+* The separate `"symlink"` sidecar attribute remains available via
+  `backend setmeta`/`lsjson --metadata`; it is not consumed by the FUSE path.
 
 ### 3. Production `pcloud` + `crypt` + `posixmeta` Stack
 
@@ -383,9 +425,10 @@ Known limitations:
   cache_ttl = 5m
   writeback_delay = 500ms
   ```
-* Mount `pcloud_posix:` with `--metadata-push --vfs-cache-mode writes` (or
-  `full`) and verify that `chmod`, `chown`, `stat`, file creation, renames, and
-  deletes persist across remounts.
+* Mount `pcloud_posix:` with
+  `--metadata-push --vfs-links --vfs-cache-mode writes` (or `full`) and verify
+  that `chmod`, `chown`, `stat`, symlinks, file creation, renames, and deletes
+  persist across remounts.
 
 ### 4. CLI Subpath Re-rooting (`pm:<path>`) — Fixed
 
