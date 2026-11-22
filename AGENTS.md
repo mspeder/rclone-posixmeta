@@ -18,6 +18,10 @@ When used for encrypted cloud FUSE mounts, the stack is ordered from bottom to t
 ## 2. Repository & Build Conventions
 
 * **Primary Backend Implementation:** `backend/posixmeta/posixmeta.go`
+* **Durability / scale notes:** `docs/durability-and-scale.md` lists what was
+  hardened (writeback retries, ordered per-path writes, shutdown/atexit flush,
+  listing priming, feature delegation) and every accepted residual limitation.
+  Design rationale: `docs/adr/0004-durable-writeback-and-delegation.md`.
 * **Backend Registration:** Imported in `backend/all/all.go` (`_ "github.com/rclone/rclone/backend/posixmeta"`).
 * **Build Command:**
   ```bash
@@ -82,9 +86,42 @@ Agents modifying `backend/posixmeta/posixmeta.go` **must** preserve the followin
 3. **Sidecar Hiding & Lifecycle Coupling:**
    * When `hide_sidecars = true` (default), `List` and `NewObject` must filter out any path ending with `sidecar_suffix` (`.posixmeta`), and `Put` must reject direct writes to sidecar paths.
    * `Move`, `DirMove`, `Remove`, `Rmdir`, and `Purge` must keep sidecars synchronized (moving or deleting `<entry>.posixmeta` alongside `<entry>`).
-4. **Coalesced Writeback & Flush Safety:**
-   * Rapid metadata updates are coalesced in memory via `writeback_delay` and flushed asynchronously.
-   * `CleanUp` and `backend setmeta` must flush pending writes (`flushPending` / `flushAllPending`) so short-lived CLI commands and unmounts never lose sidecar updates.
+4. **Coalesced Writeback, Bounded Cache & Flush Safety:**
+   * Rapid metadata updates are coalesced in memory via `writeback_delay` and
+     flushed by a pool of `writeback_workers` goroutines. Timers only enqueue a
+     path; the `f.pending` entry is the source of truth and is deleted **only
+     after** a successful write, so failures are retried with exponential
+     backoff (`writeback_retry_max`) instead of being dropped.
+   * At most one write per path is in flight (`f.inflight` + per-path
+     generation); a superseding update is re-queued when the older write
+     finishes, so a stale snapshot can never land after a newer one.
+   * `f.pending` is bounded by `pending_max_entries`; on overflow the update is
+     persisted synchronously by the caller (never dropped).
+   * `CleanUp`, `backend setmeta` and `fs.Shutdowner` (`Shutdown`) flush pending
+     writes. `rclone mount` never evicts its `Fs`, so `NewFs` also registers one
+     `lib/atexit` handler (`flushLiveFs`) which flushes every live `Fs` with
+     queued updates on normal exit and on SIGINT/SIGTERM.
+   * Destructive or replacing operations (`Remove`, `Rmdir`, `Purge`, `Move`,
+     `DirMove`, `Copy`, `Mkdir`) must call `quiesceAbs`/`quiescePrefix` (cancel
+     queued updates **and** wait out in-flight writes) so a late writeback cannot
+     resurrect a deleted sidecar or overwrite new metadata.
+   * The read-through sidecar cache must stay bounded: `cache_max_entries`
+     (default 65536) and `cache_max_size` (default 64 MiB, approximate) evict
+     least recently used entries, expired entries are dropped on access instead of
+     accumulating, and every insert/remove keeps `f.cache`, `f.cacheLRU` and
+     `f.cacheBytes` consistent. Eviction must never change observable metadata —
+     it is a pure cache, and `f.pending` remains the source of truth for
+     unflushed updates.
+   * Concurrent cold reads of the same sidecar are coalesced (singleflight), and
+     sidecar reads are capped at 1 MiB; corrupt/oversized/future-schema sidecars
+     are counted, logged and treated as absent (never fatal).
+   * `rclone backend cachestats pm:` reports occupancy (`entries`, `bytes`, caps,
+     `pending_writes`, `inflight_writes`) and health (`hits`/`misses`/
+     `evictions`, `written`, `failed_writes`, `retried_writes`,
+     `overflow_writes`, `last_write_error`). A standalone CLI process always
+     starts with an empty cache; to observe a live mount's cache, start the mount
+     with `--rc` and call `rclone rc backend/command command=cachestats fs=pm:`
+     (the mount's `fs/cache` entry is reused).
 5. **Crypt Password Obscuring:**
    * Any `rclone.conf` created for automated tests using `type = crypt` **must** obscure `password` and `password2` via `./rclone-posixmeta obscure <plaintext>` before writing the config file. Plaintext passwords cause `input too short when revealing password - is it obscured?`.
 6. **Root-Boundary Sidecar Resolution:**
@@ -109,6 +146,31 @@ Agents modifying `backend/posixmeta/posixmeta.go` **must** preserve the followin
    * `--vfs-links` is deliberately opt-in and has no mount preflight: without
      it `ln -s`/`readlink` fail loudly, and forcing it would reinterpret
      literal `*.rclonelink` objects and break existing mounts.
+9. **Listing-driven cache priming:**
+   * `List` must derive sidecar presence from the raw listing it already has: key
+     every non-sidecar entry as absent for free (`primeNegative`), and prefetch
+     the sidecars that do exist with `prefetch_workers` goroutines (capped at
+     `64*prefetch_workers` entries and 30 s per listing). This is what keeps a
+     `stat` storm after a directory read from costing one remote read per entry.
+   * `ListR` must delegate to the wrapped `ListR` (falling back to a local
+     recursion) and must **not** negative-prime: batched recursive callbacks can
+     split a directory, so "no sibling sidecar in this batch" is not proof of
+     absence (see `docs/durability-and-scale.md`, residual 6).
+10. **Wrapped-feature delegation and overwrite policy:**
+   * Forward `Copy`, `ListR`, `ChangeNotify`, `MkdirMetadata`, `PutUnchecked`,
+     `About`, `DirCacheFlush` (+ `SlowModTime`/`NoMultiThreading`) to the wrapped
+     backend, keeping sidecars in sync (`Copy` copies/removes the destination
+     sidecar; `MkdirMetadata` routes POSIX keys to the sidecar).
+   * Only advertise `Copy`, `ChangeNotify` and `About` when the wrapped backend
+     implements them, so callers fall back to their generic paths.
+   * `PartialUploads` must **not** be advertised: rclone's `.partial` staging name
+     would bypass the "reject writes to a sidecar path" guard.
+   * `overwrite_metadata = preserve` (default) keeps the previous sidecar across
+     an overwrite unless the upload carries POSIX metadata; `reset` drops it. Do
+     not change the default: the VFS re-upload of a file carries no metadata, so
+     `reset` would lose `chmod`/`chown` on every write through the mount. See
+     `docs/durability-and-scale.md` and
+     `docs/adr/0004-durable-writeback-and-delegation.md`.
 
 ## 4. Automated Verification Procedures
 
@@ -161,6 +223,8 @@ inherit_parent_owner = true
 sidecar_suffix = .posixmeta
 hide_sidecars = true
 cache_ttl = 5m
+cache_max_entries = 65536
+cache_max_size = 64M
 writeback_delay = 50ms
 EOF
 
@@ -237,6 +301,8 @@ inherit_parent_owner = true
 sidecar_suffix = .posixmeta
 hide_sidecars = true
 cache_ttl = 5m
+cache_max_entries = 65536
+cache_max_size = 64M
 writeback_delay = 50ms
 EOF
 
@@ -423,7 +489,14 @@ Uses the upstream `.rclonelink` model (design A in
   sidecar_suffix = .posixmeta
   hide_sidecars = true
   cache_ttl = 5m
+  cache_max_entries = 65536
+  cache_max_size = 64M
   writeback_delay = 500ms
+  writeback_workers = 4
+  writeback_retry_max = 5m
+  pending_max_entries = 65536
+  prefetch_workers = 8
+  overwrite_metadata = preserve
   ```
 * Mount `pcloud_posix:` with
   `--metadata-push --vfs-links --vfs-cache-mode writes` (or `full`) and verify
@@ -435,3 +508,88 @@ Uses the upstream `.rclonelink` model (design A in
 * `rclone moveto pm:a.txt pm:b.txt`, `rclone moveto pm:dir pm:dir2`, `rclone rmdir pm:dir` and `rclone purge pm:dir` open the wrapped remote re-rooted at the requested subpath. Originally, sidecars at or above that root (`<dir>.posixmeta`, ancestor owner sidecars) were invisible, so moves/deletes leaked them and `lsjson --metadata pm:dir/file` lost parent-owner inheritance.
 * Implemented in `backend/posixmeta/posixmeta.go`: `NewFs` now mirrors `fs.ErrorIsFile` by rooting at the file's parent, and keeps `f.base` (wrapped base root) for identity-mapped sidecar I/O (`absRemote`). `Move`, `DirMove`, `Rmdir`, `Purge`, `getSidecar`, writeback, cache invalidation, and ancestor resolution all use base-relative paths.
 * Covered by `01-cli` tests `test_cli_move_propagates_sidecar`, `test_cli_rmdir_removes_directory_sidecar`, `test_cli_dir_move_propagates_directory_sidecar`, `test_cli_purge_removes_directory_sidecar`, `test_cli_subpath_metadata_inherits_ancestor_owner`, `02-mount-crypt` tests `test_crypt_subpath_dir_move_preserves_metadata`, `test_crypt_subpath_rmdir_removes_encrypted_sidecar`, plus Go unit tests `TestNewFsFileRootReturnsParent`, `TestSubpathInheritsOwnerFromSidecarOutsideRoot`, `TestRmdirAtRootRemovesSidecarOutsideRoot`.
+
+### 5. Bounded Sidecar Cache — Fixed
+
+* The sidecar TTL cache used to be an unbounded `map[string]cacheEntry`: every distinct path resolved (including the negative entries produced by parent-owner ancestor lookups) stayed resident for the lifetime of the process, which is unsafe for months-long mounts over large remotes.
+* It is now an LRU (`container/list` + map) bounded by `cache_max_entries` (default 65536) and `cache_max_size` (default 64 MiB, approximate accounting in `cacheEntrySize`). Expired entries are removed when they are touched instead of accumulating, and every invalidation path keeps the LRU order and byte counter exact (`removeCacheEntryLocked`, `clearCacheLocked`).
+* Eviction never affects correctness: reads fall back to the wrapped remote, mutations invalidate before writing, and unflushed updates live in `f.pending`, which is consulted before the cache. A single entry larger than the byte budget stays cached rather than thrashing.
+* Monitor long-lived mounts with `rclone backend cachestats pm:` (`entries`, `bytes`, `max_entries`, `max_bytes`, `hits`, `misses`, `evictions`, `ttl`, `pending_writes`). A standalone CLI invocation reports a fresh, empty cache; for live numbers mount with `--rc` and use `rclone rc backend/command command=cachestats fs=pm:`.
+* Covered by Go unit tests `TestCacheMaxEntriesIsEnforced`, `TestCacheKeepsRecentlyUsedEntries`, `TestCacheDropsExpiredEntriesOnAccess`, `TestCacheByteBudget`, `TestCacheInvalidatePrefixFreesBudget`, `TestCacheUnlimitedWhenZero`, `TestCacheStatsCommand`, `TestCacheConcurrentAccess`.
+
+
+### 6. Durable, Ordered Sidecar Writeback — Fixed
+
+* The debounce queue used to be fire-and-forget: the pending entry was deleted
+  before the upload, failures were logged once and dropped, N dirty entries
+  meant N concurrent upload goroutines, and an unmount lost everything still
+  inside `writeback_delay` (a mount never evicts its `Fs`, and
+  `vfs.VFS.Shutdown` does not call the backend).
+* It is now one engine: timers enqueue paths into a bounded channel served by
+  `writeback_workers`; `f.pending` is the source of truth and is cleared only
+  after a successful write; failures retry with exponential backoff
+  (`writeback_retry_max`); `pending_max_entries` bounds the queue (overflow is
+  written synchronously); one in-flight write per path + generation numbers
+  guarantee that a stale snapshot can never overwrite a newer one.
+* `Shutdown` (`fs.Shutdowner`) flushes and stops the workers, and a single
+  `lib/atexit` handler flushes every live `Fs` at process exit (normal exit and
+  SIGINT/SIGTERM), which is what makes "`chmod` then `fusermount -u`" safe.
+* Destructive/replacing operations quiesce first (`quiesceAbs`,
+  `quiescePrefix`): queued updates are cancelled *and* in-flight writes awaited,
+  so `Remove`/`Rmdir`/`Purge`/`Move`/`DirMove`/`Copy`/`Mkdir` cannot be undone
+  by a late writeback.
+* Covered by `TestWritebackRetriesUntilSuccess`, `TestWritebackKeepsNewestUpdate`,
+  `TestPendingCancelledOnRemove`, `TestShutdownFlushesPending`,
+  `TestPendingCapFallsBackToSync`, plus `02-mount-crypt`
+  `test_mount_chmod_survives_immediate_unmount` and
+  `test_mount_rewrite_preserves_metadata`.
+
+### 7. Scale: Listing Priming, Singleflight and Cheaper Resolution — Fixed
+
+* `List` now derives sidecar presence from the listing it already has: entries
+  without a `.posixmeta` sibling are cached as absent for free, existing
+  sidecars are prefetched with `prefetch_workers` (bounded), so the `stat` storm
+  that follows a directory read is served from the cache.
+* `resolve` reads the entry's own sidecar first and only walks ancestors for the
+  ownership fields it does not override; `inheritedOwner` is shared with
+  `buildSparseSidecar` instead of duplicating the walk.
+* Concurrent cold reads of the same sidecar are coalesced (singleflight), and
+  sidecar reads are capped at 1 MiB with corrupt/oversized/future-schema
+  payloads treated as absent (counted and logged, never fatal).
+* `posixDirectory.SetMetadata` only invalidates the subtree when uid/gid
+  actually changed (a plain `chmod` keeps descendant cache entries).
+* Covered by `TestGetSidecarSingleflight`, `TestListPrimesSidecarCache`,
+  `TestListRHidesSidecars`, `TestResolveIgnoresUnusableSidecars`.
+
+### 8. Wrapped-Feature Delegation — Fixed
+
+* `Copy` (server-side copy + sidecar copy/cleanup), `ListR` (bulk recursive
+  listing, sidecars hidden), `ChangeNotify` (cache invalidation), `MkdirMetadata`
+  (directory metadata from `copy --metadata`), `PutUnchecked`, `About`,
+  `DirCacheFlush` and the `SlowModTime`/`NoMultiThreading` flags are forwarded to
+  the wrapped backend.
+* `Copy`/`ChangeNotify`/`About` are only advertised when the wrapped backend has
+  them, and `PartialUploads` is deliberately not propagated (rclone's `.partial`
+  name would bypass the sidecar-path guard).
+* `overwrite_metadata` (new option, default `preserve`) defines what happens to
+  an existing sidecar when an object is overwritten.
+* Covered by `TestMkdirMetadataStoresSidecar`, `TestPutAppliesIncomingMetadata`,
+  `TestPutOverwriteMetadataPolicy`, `TestInvalidOverwriteMetadataRejected`,
+  `TestPurgeFallbackRemovesSidecars`, `TestRmdirRemovesOrphanSidecar`.
+
+### 9. Next Areas / Accepted Residuals
+
+The full, itemised list lives in `docs/durability-and-scale.md` §3. The ones
+worth planning for:
+
+* The debounce queue is memory-only: a `SIGKILL`/power loss can lose the last
+  `writeback_delay` window (use `writeback_delay = 0` when that matters).
+* `overwrite_metadata = preserve` (default) means plain `copy`/`sync` over an
+  existing object inherits its metadata; use `reset` for copy-only remotes.
+* Payload + sidecar are two objects (not atomic as a pair), and there is no
+  single-writer coordination between two mounts of the same remote.
+* Recursive metadata enumeration (`lsjson -R --metadata`) still costs one
+  sidecar lookup per entry because `ListR` cannot safely prime the cache.
+* Prefix invalidation and quiescing scan the cache/pending maps (O(entries),
+  only on directory moves/purges and owner changes).
+

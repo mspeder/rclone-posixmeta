@@ -380,3 +380,47 @@ test_crypt_subpath_rmdir_removes_encrypted_sidecar() {
 
 	pm_assert_eq "0" "$(pm lsjson pm: | jq 'length')" "directory and its encrypted sidecar removed"
 }
+
+# A chmod immediately followed by an unmount must still reach the remote: the
+# debounced writeback queue is flushed by fs.Shutdowner when the mount's fs
+# cache entry is torn down. A very long writeback_delay proves that only the
+# shutdown path can have persisted it.
+test_mount_chmod_survives_immediate_unmount() {
+	PM_CFG_OPTS[writeback_delay]=1h
+	_mount_setup
+	_mount_start
+
+	printf 'payload\n' >"$PM_MNT/persist.txt"
+	pm_wait_entry pm: persist.txt
+	chmod 0700 "$PM_MNT/persist.txt"
+	# No wait: unmount as soon as chmod returns.
+	pm_mount_stop "$PM_MNT"
+
+	pm_assert_eq "0700" "$(pm_meta_of pm: persist.txt mode)" \
+		"debounced chmod flushed on unmount"
+}
+
+# Rewriting a file through the mount must not lose its metadata: the VFS
+# re-uploads the payload without repeating mode/uid/gid, so overwrite_metadata
+# defaults to preserve.
+test_mount_rewrite_preserves_metadata() {
+	_mount_setup
+	_mount_start
+
+	printf 'first payload\n' >"$PM_MNT/over.txt"
+	pm_wait_entry pm: over.txt
+	chmod 0640 "$PM_MNT/over.txt"
+	pm_wait_meta pm: over.txt mode 0640 5
+
+	printf 'second payload\n' >"$PM_MNT/over.txt"
+	pm_wait_for 10 grep -q 'second payload' "$PM_MNT/over.txt"
+
+	pm_assert_eq "640" "$(stat -c '%a' "$PM_MNT/over.txt")" \
+		"getattr keeps mode after rewrite"
+	pm_assert_eq "0640" "$(pm_meta_of pm: over.txt mode)" \
+		"metadata survives rewrite through the mount"
+	pm_assert_mount_has_no_sidecars "$PM_MNT"
+
+	pm_mount_stop "$PM_MNT"
+}
+

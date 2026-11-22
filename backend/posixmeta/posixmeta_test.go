@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -52,6 +54,12 @@ func testConfig(rawDir string, extra map[string]string) configmap.Simple {
 		"hide_sidecars":        "true",
 		"cache_ttl":            "0",
 		"writeback_delay":      "0",
+		"writeback_workers":    "4",
+		"writeback_retry_max":  "1m",
+		"pending_max_entries":  "1024",
+		"cache_max_entries":    "65536",
+		"cache_max_size":       "64M",
+		"prefetch_workers":     "4",
 	}
 	for k, v := range extra {
 		m[k] = v
@@ -70,7 +78,7 @@ func newTestFsAt(t *testing.T, rawDir, root string, extra map[string]string) *Fs
 	if !ok {
 		t.Fatalf("NewFs returned %T, want *Fs", fsi)
 	}
-	t.Cleanup(func() { _ = f.CleanUp(context.Background()) })
+	t.Cleanup(func() { _ = f.Shutdown(context.Background()) })
 	return f
 }
 
@@ -493,7 +501,7 @@ func TestFlushAllPendingWritesSidecar(t *testing.T) {
 	f := newTestFs(t, rawDir, map[string]string{"writeback_delay": "1h"})
 	sidecarPath := filepath.Join(rawDir, "d", "x.txt"+defaultSuffix)
 
-	if err := f.scheduleSidecarUpdate(ctx, "d/x.txt", false, &sidecarData{
+	if err := f.scheduleSidecarUpdate(ctx, "d/x.txt", &sidecarData{
 		Version: sidecarSchemaVersion,
 		Mode:    "0700",
 	}); err != nil {
@@ -524,7 +532,7 @@ func TestScheduleNilDeletesSidecar(t *testing.T) {
 		Mode:    "0700",
 	})
 
-	if err := f.scheduleSidecarUpdate(ctx, "x.txt", false, nil); err != nil {
+	if err := f.scheduleSidecarUpdate(ctx, "x.txt", nil); err != nil {
 		t.Fatalf("scheduleSidecarUpdate(nil): %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(rawDir, "x.txt"+defaultSuffix)); !os.IsNotExist(err) {
@@ -690,6 +698,133 @@ func TestRmdirAtRootRemovesSidecarOutsideRoot(t *testing.T) {
 	}
 }
 
+func TestCacheMaxEntriesIsEnforced(t *testing.T) {
+	ctx := context.Background()
+	rawDir := t.TempDir()
+	f := newTestFs(t, rawDir, map[string]string{
+		"cache_ttl":         "5m",
+		"cache_max_entries": "8",
+		"cache_max_size":    "0",
+	})
+
+	for i := 0; i < 100; i++ {
+		if _, err := f.getSidecarAbs(ctx, fmt.Sprintf("dir%02d/file%03d.txt", i%5, i)); err != nil {
+			t.Fatalf("getSidecarAbs(%d): %v", i, err)
+		}
+	}
+
+	f.mu.Lock()
+	entries, lruLen := len(f.cache), f.cacheLRU.Len()
+	f.mu.Unlock()
+	if entries > 8 {
+		t.Fatalf("cache holds %d entries, want <= 8", entries)
+	}
+	if entries != lruLen {
+		t.Fatalf("cache map has %d entries but LRU list has %d", entries, lruLen)
+	}
+	assertCacheConsistent(t, f)
+}
+
+func TestCacheKeepsRecentlyUsedEntries(t *testing.T) {
+	ctx := context.Background()
+	rawDir := t.TempDir()
+	f := newTestFs(t, rawDir, map[string]string{
+		"cache_ttl":         "5m",
+		"cache_max_entries": "3",
+		"cache_max_size":    "0",
+	})
+	mode := func(s string) *sidecarData { return &sidecarData{Version: sidecarSchemaVersion, Mode: s} }
+
+	f.putCache("hot.txt", mode("0700"))
+	f.putCache("a.txt", mode("0701"))
+	f.putCache("b.txt", mode("0702"))
+	// Re-reading the hot entry must protect it from the next eviction.
+	if _, err := f.getSidecarAbs(ctx, "hot.txt"); err != nil {
+		t.Fatalf("getSidecarAbs(hot.txt): %v", err)
+	}
+	f.putCache("c.txt", mode("0703"))
+
+	f.mu.Lock()
+	_, hotOK := f.cache["hot.txt"]
+	_, aOK := f.cache["a.txt"]
+	_, bOK := f.cache["b.txt"]
+	_, cOK := f.cache["c.txt"]
+	f.mu.Unlock()
+	if !hotOK {
+		t.Fatal("recently used entry hot.txt was evicted")
+	}
+	if aOK {
+		t.Fatal("least recently used entry a.txt should have been evicted")
+	}
+	if !bOK || !cOK {
+		t.Fatal("expected b.txt and c.txt to remain cached")
+	}
+	assertCacheConsistent(t, f)
+}
+
+func TestCacheDropsExpiredEntriesOnAccess(t *testing.T) {
+	ctx := context.Background()
+	rawDir := t.TempDir()
+	writeSidecar(t, rawDir, "e.txt", &sidecarData{Version: sidecarSchemaVersion, Mode: "0700"})
+	f := newTestFs(t, rawDir, map[string]string{
+		"cache_ttl":         "5ms",
+		"cache_max_entries": "0",
+		"cache_max_size":    "0",
+	})
+
+	if _, err := f.getSidecarAbs(ctx, "e.txt"); err != nil {
+		t.Fatalf("getSidecarAbs: %v", err)
+	}
+	if err := os.Remove(filepath.Join(rawDir, "e.txt"+defaultSuffix)); err != nil {
+		t.Fatalf("Remove sidecar: %v", err)
+	}
+	time.Sleep(25 * time.Millisecond)
+
+	sc, err := f.getSidecarAbs(ctx, "e.txt")
+	if err != nil {
+		t.Fatalf("getSidecarAbs after expiry: %v", err)
+	}
+	if sc != nil {
+		t.Fatalf("expired cache entry was served: %+v", sc)
+	}
+
+	f.mu.Lock()
+	entries, bytes, lruLen := len(f.cache), f.cacheBytes, f.cacheLRU.Len()
+	f.mu.Unlock()
+	if entries != 1 || lruLen != 1 {
+		t.Fatalf("expired entry was not replaced: entries=%d lru=%d", entries, lruLen)
+	}
+	want := cacheEntrySize("e.txt", nil)
+	if bytes != want {
+		t.Fatalf("cacheBytes = %d, want %d", bytes, want)
+	}
+	assertCacheConsistent(t, f)
+}
+
+func TestCacheByteBudget(t *testing.T) {
+	rawDir := t.TempDir()
+	f := newTestFs(t, rawDir, map[string]string{
+		"cache_ttl":         "5m",
+		"cache_max_entries": "0",
+		"cache_max_size":    "2k",
+	})
+	target := strings.Repeat("t", 1500)
+	for i := 0; i < 10; i++ {
+		f.putCache(fmt.Sprintf("link%02d", i), &sidecarData{Version: sidecarSchemaVersion, Symlink: target})
+	}
+
+	f.mu.Lock()
+	entries, bytes := len(f.cache), f.cacheBytes
+	f.mu.Unlock()
+	if bytes > 2048 {
+		t.Fatalf("cacheBytes = %d, want <= 2048", bytes)
+	}
+	if entries == 0 {
+		t.Fatal("byte budget evicted every entry, including the one just inserted")
+	}
+	assertCacheConsistent(t, f)
+}
+
 func TestPurgeAtRootRemovesSidecarOutsideRoot(t *testing.T) {
 	ctx := context.Background()
 	rawDir := t.TempDir()
@@ -710,4 +845,165 @@ func TestPurgeAtRootRemovesSidecarOutsideRoot(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(rawDir, "d"+defaultSuffix)); !os.IsNotExist(err) {
 		t.Fatalf("root directory sidecar still exists (stat err=%v)", err)
 	}
+}
+
+// assertCacheConsistent verifies that the cache map, LRU list and byte counter
+// agree, which is what makes eviction and invalidation safe.
+func assertCacheConsistent(t *testing.T, f *Fs) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.cache) != f.cacheLRU.Len() {
+		t.Fatalf("cache map has %d entries but LRU list has %d", len(f.cache), f.cacheLRU.Len())
+	}
+	var recomputed int64
+	for key, ce := range f.cache {
+		if ce.elem == nil {
+			t.Fatalf("cache entry %q has no LRU element", key)
+		}
+		if got, _ := ce.elem.Value.(string); got != key {
+			t.Fatalf("cache entry %q is linked to LRU item %q", key, got)
+		}
+		recomputed += ce.size
+	}
+	if recomputed != f.cacheBytes {
+		t.Fatalf("cacheBytes = %d, want %d", f.cacheBytes, recomputed)
+	}
+}
+
+func TestCacheInvalidatePrefixFreesBudget(t *testing.T) {
+	rawDir := t.TempDir()
+	f := newTestFs(t, rawDir, map[string]string{
+		"cache_ttl":         "5m",
+		"cache_max_entries": "0",
+		"cache_max_size":    "0",
+	})
+	f.putCache("d/a.txt", &sidecarData{Version: sidecarSchemaVersion, Mode: "0700"})
+	f.putCache("d/b.txt", &sidecarData{Version: sidecarSchemaVersion, Mode: "0701"})
+	f.putCache("e/c.txt", &sidecarData{Version: sidecarSchemaVersion, Mode: "0702"})
+
+	f.invalidatePrefix("d")
+	f.mu.Lock()
+	entries, bytes, lruLen := len(f.cache), f.cacheBytes, f.cacheLRU.Len()
+	f.mu.Unlock()
+	if entries != 1 || lruLen != 1 {
+		t.Fatalf("after invalidatePrefix(d): entries=%d lru=%d, want 1", entries, lruLen)
+	}
+	if want := cacheEntrySize("e/c.txt", &sidecarData{Version: sidecarSchemaVersion, Mode: "0702"}); bytes != want {
+		t.Fatalf("cacheBytes = %d, want %d", bytes, want)
+	}
+	assertCacheConsistent(t, f)
+
+	f.invalidatePrefix("")
+	f.mu.Lock()
+	entries, bytes, lruLen = len(f.cache), f.cacheBytes, f.cacheLRU.Len()
+	f.mu.Unlock()
+	if entries != 0 || lruLen != 0 || bytes != 0 {
+		t.Fatalf("after root invalidate: entries=%d lru=%d bytes=%d, want all zero", entries, lruLen, bytes)
+	}
+}
+
+func TestCacheUnlimitedWhenZero(t *testing.T) {
+	rawDir := t.TempDir()
+	f := newTestFs(t, rawDir, map[string]string{
+		"cache_ttl":         "5m",
+		"cache_max_entries": "0",
+		"cache_max_size":    "0",
+	})
+	for i := 0; i < 200; i++ {
+		f.putCache(fmt.Sprintf("f%03d", i), &sidecarData{Version: sidecarSchemaVersion, Mode: "0700"})
+	}
+	f.mu.Lock()
+	entries := len(f.cache)
+	f.mu.Unlock()
+	if entries != 200 {
+		t.Fatalf("unbounded cache holds %d entries, want 200", entries)
+	}
+	assertCacheConsistent(t, f)
+}
+
+func TestCacheStatsCommand(t *testing.T) {
+	ctx := context.Background()
+	rawDir := t.TempDir()
+	f := newTestFs(t, rawDir, map[string]string{
+		"cache_ttl":         "5m",
+		"cache_max_entries": "4",
+		"cache_max_size":    "1M",
+	})
+	f.putCache("a.txt", &sidecarData{Version: sidecarSchemaVersion, Mode: "0700"})
+	if _, err := f.getSidecarAbs(ctx, "a.txt"); err != nil {
+		t.Fatalf("getSidecarAbs: %v", err)
+	}
+
+	res, err := f.Command(ctx, "cachestats", nil, nil)
+	if err != nil {
+		t.Fatalf("Command(cachestats): %v", err)
+	}
+	stats, ok := res.(map[string]any)
+	if !ok {
+		t.Fatalf("Command(cachestats) returned %T, want map[string]any", res)
+	}
+	for _, key := range []string{"entries", "bytes", "max_entries", "max_bytes", "hits", "misses", "evictions", "ttl", "pending_writes"} {
+		if _, ok := stats[key]; !ok {
+			t.Fatalf("cachestats missing %q key: %#v", key, stats)
+		}
+	}
+	if got := stats["entries"]; got != 1 {
+		t.Fatalf("cachestats entries = %v, want 1", got)
+	}
+	if got := stats["hits"]; got != uint64(1) {
+		t.Fatalf("cachestats hits = %v, want 1", got)
+	}
+	if got := stats["max_entries"]; got != 4 {
+		t.Fatalf("cachestats max_entries = %v, want 4", got)
+	}
+}
+
+func TestCacheConcurrentAccess(t *testing.T) {
+	ctx := context.Background()
+	rawDir := t.TempDir()
+	f := newTestFs(t, rawDir, map[string]string{
+		"cache_ttl":         "5m",
+		"cache_max_entries": "16",
+		"cache_max_size":    "8k",
+	})
+
+	const workers = 8
+	const iterations = 200
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				key := fmt.Sprintf("d%d/f%d.txt", w, i%32)
+				switch i % 4 {
+				case 0:
+					f.putCache(key, &sidecarData{Version: sidecarSchemaVersion, Mode: "0700"})
+				case 1:
+					if _, err := f.getSidecarAbs(ctx, key); err != nil {
+						t.Errorf("getSidecarAbs(%q): %v", key, err)
+						return
+					}
+				case 2:
+					f.invalidateCacheAbs(key)
+				case 3:
+					f.invalidatePrefix(fmt.Sprintf("d%d", w))
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	f.mu.Lock()
+	entries := len(f.cache)
+	bytes := f.cacheBytes
+	f.mu.Unlock()
+	if entries > 16 {
+		t.Fatalf("cache holds %d entries after concurrent access, want <= 16", entries)
+	}
+	if bytes > 8192+2048 {
+		t.Fatalf("cacheBytes = %d after concurrent access, want <= 10240", bytes)
+	}
+	assertCacheConsistent(t, f)
 }

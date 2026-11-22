@@ -164,5 +164,22 @@ Covered by `test_mount_chmod_via_fuse_is_forwarded`,
 `test_mount_without_metadata_push_keeps_stock_behaviour` and
 `test_mount_metadata_push_is_opt_in`.
 
+## Durability and scale
+
+The debounced sidecar writeback is durable across slow/failing remotes and
+across unmount: updates are retried with backoff until they succeed, applied in
+order per path, and flushed by `Shutdown` and an `lib/atexit` handler (a mount
+process never evicts its `Fs`). Destructive operations cancel queued updates and
+wait for in-flight writes. Directory listings prime the cache, metadata
+resolution reads the entry first and only then its ancestors, and concurrent
+cold reads of one sidecar are coalesced.
+
+Covered by `test_mount_chmod_survives_immediate_unmount` (chmod then immediate
+unmount with `writeback_delay=1h` still persists) and
+`test_mount_rewrite_preserves_metadata` (rewriting content through the mount
+keeps the sidecar), plus the engine unit tests in
+`backend/posixmeta/engine_test.go`. See `docs/durability-and-scale.md` for the
+full list of fixes and the accepted residual limitations.
+
 When a gap is fixed, the corresponding xfail test flips to `XPASS`; run with
 `--strict-xpass` to make that a hard failure and then remove the `xfail` call.

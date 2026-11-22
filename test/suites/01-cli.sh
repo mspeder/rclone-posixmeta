@@ -4,8 +4,9 @@
 # Suite 01: non-mount CLI verification of backend/posixmeta invariants.
 #
 # Covers sparse sidecar creation, sidecar hiding, uid/gid inheritance,
-# atime/ctime suppression, move/delete/rmdir lifecycle, and rejection of
-# direct writes to sidecar paths (AGENTS.md Procedure A).
+# atime/ctime suppression, move/delete/rmdir lifecycle, rejection of
+# direct writes to sidecar paths (AGENTS.md Procedure A), and the bounds
+# reported by `rclone backend cachestats`.
 
 suite_require_cmd jq
 suite_require_cmd sha256sum
@@ -227,4 +228,24 @@ test_cli_purge_removes_directory_sidecar() {
 
 	pm_assert_no_file "$PM_SRC/proj"
 	pm_assert_no_file "$(pm_sidecar_path proj)"
+}
+
+# The sidecar cache must expose its configured bounds so long-lived mounts can
+# be monitored. A fresh CLI process starts with an empty cache, so only the
+# caps and counters are meaningful here (residency is covered by the Go unit
+# tests in suite 00).
+test_cli_cachestats_reports_cache_caps() {
+	PM_CFG_OPTS[cache_max_entries]=1234
+	PM_CFG_OPTS[cache_max_size]=1M
+	_cli_setup
+	_cli_make_file a.txt
+
+	local stats
+	stats=$(pm backend cachestats pm: 2>/dev/null)
+
+	pm_assert_contains "$stats" '"max_entries": 1234' "configured entry cap reported"
+	pm_assert_contains "$stats" '"max_bytes": 1048576' "configured byte cap reported"
+	pm_assert_contains "$stats" '"entries": 0' "fresh process starts with an empty cache"
+	pm_assert_contains "$stats" '"ttl": "5m0s"' "cache ttl reported"
+	pm_assert_contains "$stats" '"evictions": 0' "eviction counter reported"
 }
