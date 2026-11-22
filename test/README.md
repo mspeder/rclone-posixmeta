@@ -122,7 +122,8 @@ Useful helpers from `test/lib/harness.sh`:
 * configs: `pm_write_local_config`, `pm_write_crypt_config`, with overrides via
   the `PM_CFG_OPTS` associative array;
 * mounts: `pm_mount_start`, `pm_mount_stop` (also run automatically on exit),
-  `pm_assert_mount_has_no_sidecars`;
+  `pm_assert_mount_has_no_sidecars`; posixmeta mounts must pass
+  `--metadata-push` (see `_mount_start` in `02-mount-crypt.sh`);
 * control flow: `skip "reason"`, `xfail "reason"`.
 
 Tests must be independent: each runs in its own child process and scratch
@@ -139,9 +140,17 @@ sidecars and parent-owner inheritance intact.
   though the backend stores the `symlink` sidecar attribute (roadmap item 2).
 
 FUSE `chmod`/`chown`/`stat` propagation is implemented in the local rclone fork
-(`third_party/rclone`) and covered by `test_mount_chmod_via_fuse_is_forwarded`,
-`test_mount_chown_via_fuse_is_forwarded` and
-`test_mount_getattr_reflects_sidecar_metadata`.
+(`third_party/rclone`) and is **opt-in** via `--metadata-push`; without the flag
+`rclone mount` keeps stock behaviour (mount-wide `--file-perms`/`--dir-perms`,
+chmod/chown ignored). `posixmeta` declares `RequiresMetadataPush()`, so mounting
+it without the flag fails fast instead of silently dropping metadata.
+
+Covered by `test_mount_chmod_via_fuse_is_forwarded`,
+`test_mount_chown_via_fuse_is_forwarded`,
+`test_mount_getattr_reflects_sidecar_metadata`,
+`test_mount_requires_metadata_push`,
+`test_mount_without_metadata_push_keeps_stock_behaviour` and
+`test_mount_metadata_push_is_opt_in`.
 
 When a gap is fixed, the corresponding xfail test flips to `XPASS`; run with
 `--strict-xpass` to make that a hard failure and then remove the `xfail` call.

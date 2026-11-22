@@ -457,14 +457,16 @@
  	"os"
  	"syscall"
  	"time"
-@@ -38,13 +39,22 @@
+@@ -38,13 +39,24 @@
  	a.Mtime = modTime
  	a.Ctime = modTime
  	a.Blocks = Blocks
-+	// Override the mount defaults with per-entry POSIX metadata if the
-+	// backend supports it.
-+	if meta, err := f.File.Metadata(ctx); err == nil {
-+		applyPOSIXMetadata(a, meta)
++	// Override the mount defaults with per-entry POSIX metadata if
++	// --metadata-push was requested and the backend supports it.
++	if f.fsys.opt.MetadataPush {
++		if meta, err := f.File.Metadata(ctx); err == nil {
++			applyPOSIXMetadata(a, meta)
++		}
 +	}
  	return nil
  }
@@ -481,11 +483,11 @@
  func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) (err error) {
  	defer log.Trace(f, "a=%+v", req)("err=%v", &err)
  	if !f.VFS().Opt.NoModTime {
-@@ -57,6 +67,29 @@
+@@ -57,6 +69,29 @@
  	if req.Valid.Size() {
  		err = f.File.Truncate(int64(req.Size))
  	}
-+	if req.Valid.Mode() {
++	if f.fsys.opt.MetadataPush && req.Valid.Mode() {
 +		err = f.File.Chmod(ctx, req.Mode)
 +		if errors.Is(err, vfs.ENOSYS) {
 +			// The backend doesn't support POSIX metadata so preserve the
@@ -493,7 +495,7 @@
 +			err = nil
 +		}
 +	}
-+	if req.Valid.Uid() || req.Valid.Gid() {
++	if f.fsys.opt.MetadataPush && (req.Valid.Uid() || req.Valid.Gid()) {
 +		uid, gid := -1, -1
 +		if req.Valid.Uid() {
 +			uid = int(req.Uid)
@@ -521,19 +523,21 @@
  	"fmt"
  	"io"
  	"os"
-@@ -39,6 +40,11 @@
+@@ -39,6 +40,13 @@
  	a.Atime = modTime
  	a.Mtime = modTime
  	a.Ctime = modTime
-+	// Override the mount defaults with per-entry POSIX metadata if the
-+	// backend supports it.
-+	if meta, err := d.Dir.Metadata(ctx); err == nil {
-+		applyPOSIXMetadata(a, meta)
++	// Override the mount defaults with per-entry POSIX metadata if
++	// --metadata-push was requested and the backend supports it.
++	if d.fsys.opt.MetadataPush {
++		if meta, err := d.Dir.Metadata(ctx); err == nil {
++			applyPOSIXMetadata(a, meta)
++		}
 +	}
  	// FIXME include Valid so get some caching?
  	// FIXME fs.Debugf(d.path, "Dir.Attr %+v", a)
  	return nil
-@@ -47,17 +53,46 @@
+@@ -47,17 +55,46 @@
  // Check interface satisfied
  var _ fusefs.NodeSetattrer = (*Dir)(nil)
  
@@ -562,7 +566,7 @@
 -		err = d.SetModTime(time.Now())
 -	} else if req.Valid.Mtime() {
 -		err = d.SetModTime(req.Mtime)
-+	if req.Valid.Mode() {
++	if d.fsys.opt.MetadataPush && req.Valid.Mode() {
 +		err = d.Dir.Chmod(ctx, req.Mode)
 +		if errors.Is(err, vfs.ENOSYS) {
 +			// The backend doesn't support POSIX metadata so preserve the
@@ -570,7 +574,7 @@
 +			err = nil
 +		}
 +	}
-+	if req.Valid.Uid() || req.Valid.Gid() {
++	if d.fsys.opt.MetadataPush && (req.Valid.Uid() || req.Valid.Gid()) {
 +		uid, gid := -1, -1
 +		if req.Valid.Uid() {
 +			uid = int(req.Uid)
@@ -587,6 +591,63 @@
  	}
  
  	return translateError(err)
+--- a/cmd/mountlib/mount.go
++++ b/cmd/mountlib/mount.go
+@@ -46,6 +46,11 @@
+ 	Help:    "Time for which file/directory attributes are cached",
+ 	Groups:  "Mount",
+ }, {
++	Name:    "metadata_push",
++	Default: false,
++	Help:    "Push POSIX mode/uid/gid metadata to the backend and report it in getattr",
++	Groups:  "Mount",
++}, {
+ 	Name:     "option",
+ 	Default:  []string{},
+ 	Help:     "Option for libfuse/WinFsp (repeat if required)",
+@@ -186,6 +191,7 @@
+ 	ExtraOptions       []string      `config:"option"`
+ 	ExtraFlags         []string      `config:"fuse_flag"`
+ 	AttrTimeout        fs.Duration   `config:"attr_timeout"` // how long the kernel caches attribute for
++	MetadataPush       bool          `config:"metadata_push"`
+ 	DeviceName         string        `config:"devname"`
+ 	VolumeName         string        `config:"volname"`
+ 	NoAppleDouble      bool          `config:"noappledouble"`
+@@ -244,6 +250,24 @@
+ 	}
+ }
+ 
++// metadataPushRequirer is implemented by backends which store POSIX
++// mode/uid/gid metadata. Mounting such a backend without --metadata-push
++// would silently hide that metadata and drop chmod/chown, so it is
++// rejected up front instead.
++type metadataPushRequirer interface {
++	RequiresMetadataPush() bool
++}
++
++// checkMetadataPush returns an error if the backend requires
++// --metadata-push but the mount was started without it.
++func checkMetadataPush(mnt *MountPoint) error {
++	req, ok := mnt.Fs.(metadataPushRequirer)
++	if !ok || !req.RequiresMetadataPush() || mnt.MountOpt.MetadataPush {
++		return nil
++	}
++	return fmt.Errorf("backend %q stores POSIX mode/uid/gid; mount with --metadata-push to report them in stat and forward chmod/chown", mnt.Fs.Name())
++}
++
+ // Global constants
+ const (
+ 	MaxLeafSize = 1024 // don't pass file names longer than this
+@@ -327,6 +351,9 @@
+ 			}
+ 
+ 			mnt := NewMountPoint(mount, args[1], cmd.NewFsDir(args), &Opt, &vfscommon.Opt)
++			if err := checkMetadataPush(mnt); err != nil {
++				fs.Fatalf(nil, "Fatal error: %v", err)
++			}
+ 			mountDaemon, err := mnt.Mount()
+ 
+ 			// Wait for foreground mount, if any...
 --- /dev/null
 +++ b/cmd/mount/posixmeta.go
 @@ -0,0 +1,66 @@

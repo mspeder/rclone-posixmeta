@@ -14,7 +14,16 @@ local/pcloud/S3  ->  crypt  ->  posixmeta  ->  rclone mount (FUSE)
 `posixmeta` sits above `crypt` so it sees plaintext entry names, hides
 `.posixmeta` sidecars, inherits owners from parent directories, and coalesces
 sidecar writeback. The bundled rclone fork teaches `rclone mount` to forward
-FUSE `chmod`/`chown` and report per-entry metadata from `stat`.
+FUSE `chmod`/`chown` and report per-entry metadata from `stat` when the
+`--metadata-push` mount option is given (off by default, so stock rclone
+behaviour is unchanged for other backends):
+
+```bash
+rclone-posixmeta mount pm: /mnt/pm --metadata-push --vfs-cache-mode writes
+```
+
+`posixmeta` refuses to mount without `--metadata-push` rather than silently
+ignoring the stored `mode`/`uid`/`gid`.
 
 * Architecture, invariants and test procedures: [`AGENTS.md`](AGENTS.md)
 * FUSE chmod/chown design decision:

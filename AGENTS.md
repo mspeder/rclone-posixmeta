@@ -43,7 +43,13 @@ When used for encrypted cloud FUSE mounts, the stack is ordered from bottom to t
   * `cmd/mount/`: `Attr` overlays per-entry `mode`/`uid`/`gid` from
     `fs.Metadataer` onto the mount-wide defaults, and `Setattr` forwards
     kernel `chmod`/`chown` to the node (silently ignored with ENOSYS when the
-    backend doesn't support metadata).
+    backend doesn't support metadata). Both paths are gated on the
+    `--metadata-push` mount option (default off) to preserve stock rclone
+    behaviour for `local`/`crypt`/cloud mounts.
+  * `cmd/mountlib/`: `--metadata-push` option and a preflight that rejects a
+    backend implementing `RequiresMetadataPush() bool` when the flag is
+    absent; `posixmeta` returns true, so it cannot be mounted in a silently
+    degraded state.
   Keep patches minimal and upstream-compatible so the fork can be refreshed
   (regeneration instructions: `third_party/README.md`); re-run
   `test/suites/02-mount-crypt.sh` after any rclone version bump. A
@@ -82,6 +88,14 @@ Agents modifying `backend/posixmeta/posixmeta.go` **must** preserve the followin
    * `NewFs` must mirror wrapped backends that support file roots: when the wrapped remote returns `fs.ErrorIsFile`, return an `Fs` rooted at the file's parent and propagate `fs.ErrorIsFile` (so `rclone moveto pm:a.txt pm:b.txt` works).
    * Sidecar paths are identity-mapped through `absRemote` (`f.root + "/" + remote`). All sidecar reads/writes/moves/deletes and ancestor-owner lookups use `f.base` (the wrapped remote opened at the `remote` option root) so sidecars for the root entry and above (`<root>.posixmeta`, ancestor owner sidecars) remain reachable from subpath filesystems. Payload I/O keeps using `f.wrapped` (rooted for performance).
    * `Rmdir`, `Purge`, and `DirMove` of a filesystem root must remove/move the root's sidecar in the parent directory.
+7. **Opt-in FUSE metadata:**
+   * `rclone mount` must not read or write POSIX metadata unless
+     `--metadata-push` is set. Without it, `stat`/`getattr` must keep using
+     `--file-perms`/`--dir-perms`/`--uid`/`--gid` and `chmod`/`chown` must remain
+     no-ops for **all** backends (stock rclone behaviour).
+   * `posixmeta` implements `RequiresMetadataPush() bool` returning true, so a
+     mount without the flag fails fast with an actionable error instead of
+     silently ignoring sidecars.
 
 ## 4. Automated Verification Procedures
 
@@ -217,6 +231,7 @@ EOF
 # 1. Mount posixmeta(crypt(local)) in background
 ./rclone-posixmeta --config "$CONF" mount pm_crypt: "$MNT" \
   --cache-dir "$VFS" \
+  --metadata-push \
   --vfs-cache-mode writes \
   --vfs-write-back 200ms \
   --dir-cache-time 500ms \
@@ -320,12 +335,18 @@ Implemented in the local rclone fork (`third_party/rclone`, see section 2):
   mount-wide `--file-perms`/`--dir-perms`/`--uid`/`--gid` defaults. `Setattr`
   forwards `req.Valid.Mode()`, `req.Valid.Uid()` and `req.Valid.Gid()` as
   `SetMetadata`, swallowing `ENOSYS` to preserve the legacy no-op behaviour
-  for backends without metadata.
+  for backends without metadata. Both paths require `--metadata-push`.
+* **`cmd/mountlib/mount.go`:** `--metadata-push` (default off) plus a
+  preflight rejecting backends implementing `RequiresMetadataPush() bool`
+  (`posixmeta`) when the flag is missing.
 
 Covered by `02-mount-crypt` tests
 `test_mount_chmod_via_fuse_is_forwarded`,
-`test_mount_chown_via_fuse_is_forwarded` and
-`test_mount_getattr_reflects_sidecar_metadata`, plus Procedure B step 9.
+`test_mount_chown_via_fuse_is_forwarded`,
+`test_mount_getattr_reflects_sidecar_metadata`,
+`test_mount_requires_metadata_push`,
+`test_mount_without_metadata_push_keeps_stock_behaviour` and
+`test_mount_metadata_push_is_opt_in`, plus Procedure B step 9.
 
 Known limitations:
 
@@ -362,7 +383,9 @@ Known limitations:
   cache_ttl = 5m
   writeback_delay = 500ms
   ```
-* Mount `pcloud_posix:` with `--vfs-cache-mode writes` (or `full`) and verify that `chmod`, `chown`, `stat`, file creation, renames, and deletes persist across remounts.
+* Mount `pcloud_posix:` with `--metadata-push --vfs-cache-mode writes` (or
+  `full`) and verify that `chmod`, `chown`, `stat`, file creation, renames, and
+  deletes persist across remounts.
 
 ### 4. CLI Subpath Re-rooting (`pm:<path>`) — Fixed
 

@@ -17,7 +17,8 @@ committed**. Only the unified diff is versioned:
 * `rclone-posixmeta.patch` — diff of the modified files against pristine
   `github.com/rclone/rclone@v1.76.0`
   (`vfs/vfs.go`, `vfs/file.go`, `vfs/dir.go`, `cmd/mount/file.go`,
-  `cmd/mount/dir.go`, plus new `cmd/mount/posixmeta.go`).
+  `cmd/mount/dir.go`, `cmd/mountlib/mount.go`, plus new
+  `cmd/mount/posixmeta.go`).
 
 ### Materialise / refresh the fork
 
@@ -41,7 +42,7 @@ pristine copy:
 
 ```bash
 SRC="$(go env GOMODCACHE)/github.com/rclone/rclone@v1.76.0"
-{ for f in vfs/vfs.go vfs/file.go vfs/dir.go cmd/mount/file.go cmd/mount/dir.go; do
+{ for f in vfs/vfs.go vfs/file.go vfs/dir.go cmd/mount/file.go cmd/mount/dir.go cmd/mountlib/mount.go; do
     diff -u --label "a/$f" --label "b/$f" "$SRC/$f" "third_party/rclone/$f" || true
   done
   diff -uN --label /dev/null --label b/cmd/mount/posixmeta.go /dev/null \

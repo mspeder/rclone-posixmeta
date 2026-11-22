@@ -18,6 +18,7 @@ _mount_setup() {
 
 _mount_start() {
 	pm_mount_start pm: "$PM_MNT" \
+		--metadata-push \
 		--vfs-cache-mode writes \
 		--vfs-write-back 200ms \
 		--dir-cache-time 500ms
@@ -78,6 +79,79 @@ test_mount_rename_and_delete_lifecycle() {
 	pm_assert_no_file "$PM_MNT/d/renamed.txt"
 	pm_assert_mount_has_no_sidecars "$PM_MNT"
 	pm_assert_raw_has_no_plaintext renamed
+
+	pm_mount_stop "$PM_MNT"
+}
+
+# Mounting posixmeta without --metadata-push must fail before the FUSE mount
+# starts: otherwise stat would show mount defaults and chmod/chown would be
+# silently dropped.
+test_mount_requires_metadata_push() {
+	_mount_setup
+
+	local log="$PM_TEST_SCRATCH/require-metadata-push.log" rc=0
+	timeout 30 "$PM_BINARY" --config "$PM_CONFIG" --cache-dir "$PM_VFS_CACHE" \
+		mount pm: "$PM_MNT" --vfs-cache-mode writes >"$log" 2>&1 || rc=$?
+	if ((rc == 0)); then
+		pm_fail "mount without --metadata-push unexpectedly succeeded"
+	fi
+	if ((rc == 124)); then
+		pm_fail "mount without --metadata-push hung instead of failing fast"
+	fi
+	pm_assert_contains "$(cat "$log")" "--metadata-push" \
+		"error message points at --metadata-push"
+	if mountpoint -q "$PM_MNT"; then
+		pm_fail "rejected mount left a stale FUSE mount at $PM_MNT"
+	fi
+}
+
+# Without --metadata-push the mount must behave exactly like stock rclone:
+# attrs come from --file-perms and chmod must not touch the backing file.
+test_mount_without_metadata_push_keeps_stock_behaviour() {
+	pm_write_local_config "$PM_CONFIG" "$PM_SRC"
+	printf 'local payload\n' >"$PM_SRC/local.txt"
+	chmod 0600 "$PM_SRC/local.txt"
+
+	pm_mount_start "raw:$PM_SRC" "$PM_MNT" \
+		--file-perms 0640 \
+		--dir-perms 0750 \
+		--vfs-cache-mode writes \
+		--vfs-write-back 200ms \
+		--dir-cache-time 500ms
+
+	pm_assert_eq "640" "$(stat -c '%a' "$PM_MNT/local.txt")" \
+		"attrs come from --file-perms without the flag"
+
+	chmod 0700 "$PM_MNT/local.txt"
+	pm_assert_eq "600" "$(stat -c '%a' "$PM_SRC/local.txt")" \
+		"chmod must not reach the backing file without the flag"
+
+	pm_mount_stop "$PM_MNT"
+}
+
+# --metadata-push opts in to per-entry attrs and chmod/chown write-through,
+# including for backends other than posixmeta.
+test_mount_metadata_push_is_opt_in() {
+	pm_write_local_config "$PM_CONFIG" "$PM_SRC"
+	printf 'local payload\n' >"$PM_SRC/optin.txt"
+	chmod 0600 "$PM_SRC/optin.txt"
+
+	pm_mount_start "raw:$PM_SRC" "$PM_MNT" \
+		--metadata-push \
+		--file-perms 0640 \
+		--dir-perms 0750 \
+		--vfs-cache-mode writes \
+		--vfs-write-back 200ms \
+		--dir-cache-time 500ms
+
+	pm_assert_eq "600" "$(stat -c '%a' "$PM_MNT/optin.txt")" \
+		"backend mode overrides --file-perms when opted in"
+
+	chmod 0700 "$PM_MNT/optin.txt"
+	pm_assert_eq "700" "$(stat -c '%a' "$PM_SRC/optin.txt")" \
+		"chmod reaches the backing file when opted in"
+	pm_assert_eq "700" "$(stat -c '%a' "$PM_MNT/optin.txt")" \
+		"getattr reports the pushed mode"
 
 	pm_mount_stop "$PM_MNT"
 }

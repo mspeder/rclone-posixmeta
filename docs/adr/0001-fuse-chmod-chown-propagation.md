@@ -23,6 +23,13 @@ The relevant code lives in the external module `github.com/rclone/rclone`
 behaviour cannot be fixed from the backend package alone: `cmd/mount` and
 `vfs` both need changes.
 
+A naive fix is not acceptable as a default, though: `Attr` would consult any
+`fs.Metadataer`, and `local` (as well as `crypt` over `local`) reports real
+`mode`/`uid`/`gid`. Mounting `local:` would then stop honouring
+`--file-perms`/`--dir-perms`, and `chmod`/`chown` inside the mount would mutate
+the backing files — a breaking change for every existing `rclone mount` user.
+The VFS/FUSE behaviour therefore has to be explicitly opt-in.
+
 ## Decision
 
 Fork rclone into the repository and consume it with a `replace` directive:
@@ -44,7 +51,15 @@ Patch scope (kept minimal so the fork can be refreshed from upstream):
   `ENOSYS` when the backend has no metadata support.
 * `cmd/mount/file.go`, `cmd/mount/dir.go` — overlay `mode`/`uid`/`gid` from
   `Metadata` in `Attr`; forward `Mode`/`Uid`/`Gid` from `Setattr`, ignoring
-  `ENOSYS` so non-metadata backends keep the previous no-op behaviour.
+  `ENOSYS` so non-metadata backends keep the previous no-op behaviour. Both
+  paths are gated on the new `--metadata-push` mount option (default off).
+* `cmd/mountlib/mount.go` — `--metadata-push` option, plus a preflight: a
+  backend implementing `RequiresMetadataPush() bool` is rejected with a clear
+  error when the mount lacks the flag. `posixmeta` returns true, so it cannot
+  be mounted in a silently degraded state (stat shows mount defaults, chmod
+  dropped). Backends without the method (`local`, `crypt`, S3, ...) are
+  unaffected and keep stock behaviour by default; passing `--metadata-push`
+  opts them in explicitly.
 
 ## Alternatives considered
 
@@ -58,10 +73,17 @@ Patch scope (kept minimal so the fork can be refreshed from upstream):
 
 ## Consequences
 
+* Default `rclone mount` behaviour is unchanged: no metadata reads in getattr
+  and no write-through unless `--metadata-push` is given, so mounting `local:`
+  or `crypt(local):` still honours `--file-perms`/`--dir-perms` and drops
+  `chmod`/`chown` as before.
+* `posixmeta` mounts require `--metadata-push`; without it the mount fails fast
+  with an actionable error instead of silently ignoring the stored metadata.
 * `rclone` upgrades require re-applying (or upstreaming) the patch and
   re-running the `02-mount-crypt` suite.
 * `cmount`/`mount2` (`cmd/cmount`) is intentionally out of scope; `rclone
-  mount` (bazil FUSE, Linux) is the supported path.
+  mount` (bazil FUSE, Linux) is the supported path. `cmount` accepts
+  `--metadata-push` but does not implement the overlay.
 * Chown of the mount root is not propagated (the VFS root is a synthetic
   directory with no backend entry).
 * Cross-process metadata edits remain invisible in a running mount until

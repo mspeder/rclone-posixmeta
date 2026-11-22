@@ -321,6 +321,12 @@ func (f *Fs) Hashes() hash.Set { return f.wrapped.Hashes() }
 // Features returns the optional features supported by this wrapper.
 func (f *Fs) Features() *fs.Features { return f.features }
 
+// RequiresMetadataPush reports that mounting this backend without
+// --metadata-push would silently hide the stored mode/uid/gid and drop
+// chmod/chown requests, so the mount command rejects that combination.
+// The flag is irrelevant for non-mount uses (copy, lsjson, setmeta, ...).
+func (f *Fs) RequiresMetadataPush() bool { return true }
+
 // UnWrap returns the underlying wrapped fs.Fs.
 func (f *Fs) UnWrap() fs.Fs { return f.wrapped }
 
