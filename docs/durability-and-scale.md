@@ -29,7 +29,7 @@ discovers (`fs.Shutdowner`, `fs.ListRer`, `fs.ChangeNotifier`, `fs.Copier`,
 
 | Problem | Fix |
 | --- | --- |
-| Every `stat` after a directory read cost one remote read per entry, and one per ancestor for ownership inheritance. | `List` derives the `*.posixmeta` sibling set from the listing it already has: entries without a sidecar are cached as "absent" for free, existing sidecars are prefetched with `prefetch_workers` (capped at `64*prefetch_workers` entries and 30s per listing). |
+| Every `stat` after a directory read cost one remote read per entry, and one per ancestor for ownership inheritance. | `List` derives the `.posixmeta.*` sibling set from the listing it already has: entries without a sidecar are cached as "absent" for free, existing sidecars are prefetched with `prefetch_workers` (capped at `64*prefetch_workers` entries and 30s per listing). |
 | `resolve` walked every ancestor before reading the entry's own sidecar. | The entry's sidecar is read first; ancestors are only consulted for the ownership fields it does not override. `buildSparseSidecar` reuses the same `inheritedOwner` helper instead of duplicating the walk. |
 | A cold cache with many concurrent stat calls produced a burst of identical remote reads. | `getSidecarAbs` coalesces concurrent reads of the same path (singleflight). |
 | Corrupt sidecars were re-read (and re-logged) forever, and an arbitrarily large object would be loaded into memory. | Reads are limited to 1 MiB (`maxSidecarSize`); corrupt, oversized and future-schema (`"v" > 1`) sidecars are counted once, logged, treated as absent, and cached as absent. |
@@ -68,7 +68,7 @@ Forwarded to the wrapped backend, with sidecar bookkeeping around them:
   cannot be opened, rejects unknown `overwrite_metadata` values, and warns when
   the cache is unbounded.
 * `Rmdir` removes orphaned sidecars (whose payload is gone) and retries once, so
-  a hidden `.posixmeta` can no longer cause an unexplainable "directory not
+  a hidden `.posixmeta.*` file can no longer cause an unexplainable "directory not
   empty".
 * `Purge` falls back to a sidecar-aware recursive delete when the wrapped backend
   returns `fs.ErrorCantPurge` (previously the whole directory could not be
@@ -92,6 +92,10 @@ Forwarded to the wrapped backend, with sidecar bookkeeping around them:
 | `pending_max_entries` | `65536` | Max debounced updates held in memory; beyond this, updates are written synchronously (`0` = unlimited). |
 | `prefetch_workers` | `8` | Concurrent sidecar prefetches per directory listing (`0` disables prefetching; "absent" is still cached for free). |
 | `overwrite_metadata` | `preserve` | `preserve` keeps the previous object's metadata across overwrites; `reset` drops it unless the upload carries POSIX metadata. |
+| `sidecar_layout` | `sparse` | `sparse` writes `<dir>/.posixmeta.<entry>` per overridden entry; `dir` writes one aggregate `<dir>/.posixmeta` map per directory. Recorded in the remote's root map; the two are never converted automatically. |
+| `on_corrupt` | `error` | `dir` layout only: `error` fails reads/mutations of a corrupt map, `warn` logs it and serves defaults while still refusing to overwrite it. |
+| `map_max_entries` | `100000` | `dir` layout only: entries accepted in one directory map; a larger map is treated as corrupt (`0` = unlimited). |
+| `map_max_bytes` | `8M` | `dir` layout only: accepted size of one directory map; larger maps are treated as corrupt (`0` = unlimited). |
 
 Existing options (`cache_ttl`, `cache_max_entries`, `cache_max_size`,
 `writeback_delay`, `inherit_parent_owner`, `hide_sidecars`, ...) keep their
@@ -123,7 +127,7 @@ the affected paths log and/or count errors.
    name through `posixmeta` (as it always did) instead of a
    `<name>.<hash>.partial` object. That is deliberate: `checkPartial`'s staging
    name would bypass the "reject writes to a sidecar path" guard (a
-   `x.txt.posixmeta.<hash>.partial` payload would be staged and then renamed
+   `.posixmeta.x.txt.<hash>.partial` payload would be staged and then renamed
    onto a sidecar). Atomicity of the payload stays the wrapped backend's job.
 5. **Ancestor-owner lookups still walk the tree on a cold cache.** Each level is
    one sidecar read (404 included), cached as absent for `cache_ttl`. Deep trees
@@ -166,7 +170,9 @@ the affected paths log and/or count errors.
     `rclone mount`. See `docs/adr/0001-fuse-chmod-chown-propagation.md`.
 14. **External metadata changes lag by `cache_ttl`.** A `backend setmeta` run
     from another process is invisible to a mount until the cached entry expires,
-    unless the wrapped backend implements `ChangeNotify` (`pcloud` does not).
+    unless the wrapped backend implements `ChangeNotify` (and the backend chain
+    below `posixmeta` forwards it: `pcloud` implements it, and `crypt`
+    delegates it).
 15. **`atime`/`ctime` are never stored, and the `symlink` sidecar attribute is
     not consumed by the FUSE path.** Both are intentional invariants
     (`S_IFLNK` + `--link-perms` comes from the fork/`--vfs-links`, see
@@ -175,6 +181,16 @@ the affected paths log and/or count errors.
     `MkdirMetadata` covers `copy --metadata`/`sync`; a backend or tool that
     creates directories with plain `Mkdir` and sets metadata afterwards relies on
     a following `SetMetadata` (as the mount does).
+17. **A VFS payload upload still deferred by `--vfs-write-back` is cancelled when
+    the mount disappears.** `fusermount -u` ("Unmounted externally") and
+    SIGINT/SIGTERM make `rclone mount` exit without draining the VFS upload
+    queue, so a file closed less than `--vfs-write-back` (default 5 s) before a
+    stop never reaches the remote. This is stock rclone behaviour and unrelated
+    to the sidecar queue: `posixmeta`'s own debounced updates *are* flushed by
+    `Shutdown` and the atexit handler. *Workaround:* mount with
+    `--vfs-write-back 0` (upload on close, as
+    `docs/mount-pcloud-crypt-posixmeta.md` does) or wait out the delay before
+    unmounting.
 
 
 ## 4. Operating a long-lived mount
@@ -189,7 +205,8 @@ remote = pcloud_crypt:
 default_file_mode = 0644
 default_dir_mode = 0755
 inherit_parent_owner = true
-sidecar_suffix = .posixmeta
+sidecar_prefix = .posixmeta
+proxy_links = true
 hide_sidecars = true
 cache_ttl = 5m
 cache_max_entries = 65536
@@ -203,6 +220,71 @@ overwrite_metadata = preserve
 ```
 
 Mount with `--metadata-push --vfs-links --vfs-cache-mode writes` (or `full`).
+
+### 1.5 Sidecar layout and proxied symlinks
+
+* Sidecars are now `<dir>/.posixmeta.<entry>` (`sidecar_prefix`). The remote
+  root (no subpath) has no name, so its own sidecar is the bare prefix stored
+  *inside* it; a subpath root keeps `<parent>/.posixmeta.<root>`
+  (`docs/adr/0009-sidecar-prefix-naming.md`). This is a **breaking on-disk
+  change**: `*.posixmeta` files from an older tree become ordinary visible files
+  and are not migrated. Rename them through `rclone` (also on crypt remotes) or
+  reset the metadata. The rename is cheap for `List`/pairing (a purely local
+  `sidecarTarget` mapping, no extra round-trips), and it reserves the
+  `.posixmeta.*` namespace so a user file cannot be mistaken for a sidecar.
+* `proxy_links = true` (`docs/adr/0008-proxy-link-files.md`) stores a symlink's
+  target in the entry's sidecar instead of uploading a `<name>.rclonelink`
+  payload, and synthesises the `.rclonelink` object in `List`/`ListR`/
+  `NewObject`. Consequences for durability: the sidecar write is synchronous
+  (a failed write fails `ln -s` instead of being retried after the link was
+  reported as created), targets are limited to 64 KiB and validated, `Move`/
+  `Copy`/`Remove` carry the sidecar, renaming a link to a non-link name
+  materialises the target as a regular file, and `NewFs` probes the sidecar to
+  mirror `fs.ErrorIsFile` for a link root.
+* Residual: link payloads and sidecars are still two objects for ordinary
+  files; `proxy_links` only removes the payload for links. Link mtime is the
+  sidecar's mtime, and `SetModTime` on a link is a no-op. While `proxy_links`
+  is enabled, a literal `<name>.rclonelink` payload is shadowed by a sidecar
+  `symlink` for the same visible name.
+
+### 1.6 Per-directory aggregate layout (`sidecar_layout = dir`)
+
+* `sidecar_layout = sparse` (default) is the per-entry layout above.
+  `sidecar_layout = dir` writes one schema-v2 JSON map per directory,
+  `<dir>/.posixmeta`, holding every entry that has an override (the key is the
+  entry name; `"."` is the base root entry). The map carries a CRC-32 of its
+  canonical JSON (8 lowercase hex digits) and the remote's root map (created
+  once, never deleted) records the layout, so `pm:dir` still reads its own
+  attributes from the parent map. The schema version is the sole layout
+  discriminator (v1 = sparse, v2 = dir); there is no separate `layout` field.
+* **One object and one read per directory.** `List` loads the directory's map
+  once and derives all metadata (and any proxied symlink) from it, so a
+  `stat` storm after a listing costs nothing extra; `cachestats` on a live mount
+  reports `maps`, `maps_bytes`, `dirty_maps` and `corrupt_maps`.
+* **Coalesced, ordered writeback.** The map is the writeback unit: updates are
+  merged in memory, the debounce engine keys its queue/in-flight set by the map
+  directory, and each flush serialises one whole snapshot through a
+  `<prefix>.tmp` staging object plus a server-side `Move`. One in-flight write
+  per map and generation checks mean an older snapshot can never land after a
+  newer one, and an unchanged map uploads nothing.
+* **Fail closed on corruption.** Unparsable JSON, a CRC mismatch, an unknown
+  schema, or a map beyond `map_max_entries`/`map_max_bytes` makes the whole
+  directory's metadata unusable: reads error, mutations are refused, and the
+  object is never rewritten. `on_corrupt = error` is the default;
+  `on_corrupt = warn` serves defaults while still refusing writes. Recover with
+  `rclone backend repair pm:` (dry run by default; add
+  `-o dry_run=false -o confirm=REPAIR` to quarantine and rewrite).
+* **Layout mismatches are explicit.** The schema version is the only layout
+  discriminator (v1 = sparse, v2 = dir); opening a remote with the other layout
+  (or listing a directory that contains the other layout's objects) fails with
+  `refusing to mix layouts` instead of silently ignoring metadata. There is no
+  migration tooling: rewriting the tree with the other layout is the conversion.
+* Residuals: a corrupt or oversized map costs a whole directory's metadata, not
+  one entry; every change in a directory rewrites its map (a cross-directory
+  rename rewrites two), which is why the caps exist; the mount's `Attr` swallows
+  `Metadata()` errors, so a cached `stat` shows defaults on a corrupt map while
+  `ls`/`chmod`/`NewObject` fail; and a map is still two objects with its
+  payloads (no atomic multi-object commit).
 
 ### Monitoring
 

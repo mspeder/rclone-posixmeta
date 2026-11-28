@@ -28,6 +28,11 @@
 
 set -uo pipefail
 
+# Pin the umask: rclone mount derives --dir-perms/--file-perms and the FUSE
+# create modes (which posixmeta now records) from it, so a different developer
+# umask would silently change the expected modes.
+umask 022
+
 TEST_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$TEST_DIR/.." && pwd)
 HARNESS_LIB="$TEST_DIR/lib/harness.sh"
@@ -195,7 +200,7 @@ needs_build() {
 build_binary() {
 	needs_build || return 0
 	command -v go >/dev/null 2>&1 || die "go toolchain not found; use --binary or --no-build"
-	# The rclone fork is materialised from third_party/rclone-posixmeta.patch
+	# The rclone fork is materialised from third_party/patches/*.patch
 	# and is not versioned, so a fresh clone has to bootstrap it first.
 	if [[ ! -f $REPO_ROOT/third_party/rclone/.posixmeta-fork ]]; then
 		printf 'Materialising third_party/rclone from patch\n'

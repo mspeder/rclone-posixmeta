@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,7 +29,12 @@ import (
 
 const (
 	sidecarSchemaVersion = 1
-	defaultSuffix        = ".posixmeta"
+	defaultSidecarPrefix = ".posixmeta"
+
+	// maxLinkTargetSize bounds the target read when a symlink is proxied into
+	// its sidecar. A real target is far below PATH_MAX, so anything larger is
+	// rejected instead of being stored.
+	maxLinkTargetSize = 64 << 10
 
 	// overwriteMetadataPreserve keeps an existing sidecar when an object is
 	// overwritten without POSIX metadata (the safe default for VFS writeback).
@@ -52,6 +58,11 @@ func init() {
 				Name:  "cachestats",
 				Short: "Show sidecar cache occupancy and effectiveness",
 				Long:  "Reports cached entry count, approximate memory usage, configured caps, hit/miss/eviction counters and the pending writeback count.",
+			},
+			{
+				Name:  "repair",
+				Short: "Check and repair directory metadata maps",
+				Long:  "Validates every directory map of a sidecar_layout=dir remote, optionally quarantining and salvaging corrupt maps, dropping invalid entries and orphan keys, and removing stale staging objects. Dry run unless -o dry_run=false -o confirm=REPAIR is given.",
 			},
 		},
 		NewFs: NewFs,
@@ -116,14 +127,47 @@ func init() {
 				Default: true,
 			},
 			{
-				Name:    "sidecar_suffix",
-				Help:    "Suffix appended to entry names for metadata sidecars.",
-				Default: defaultSuffix,
+				Name:    "sidecar_prefix",
+				Help:    "Prefix used to name sidecars in the same directory as their entry: `<prefix>.<name>`. The base root entry, which has no name, uses the bare prefix.",
+				Default: defaultSidecarPrefix,
+			},
+			{
+				Name:    "sidecar_layout",
+				Help:    "On-disk metadata layout: 'sparse' stores one `<prefix>.<name>` sidecar per entry that has overrides, 'dir' stores one `<prefix>` map per directory holding all of its entries. The layout is recorded in the remote's root map and must match, since the two are never converted automatically.",
+				Default: layoutSparse,
+				Examples: []fs.OptionExample{
+					{Value: layoutSparse, Help: "One sidecar per entry with overrides (schema v1)."},
+					{Value: layoutDir, Help: "One aggregate metadata map per directory (schema v2)."},
+				},
+			},
+			{
+				Name:    "on_corrupt",
+				Help:    "How to treat an unreadable directory map: 'error' fails reads and mutations for that directory (fail closed), 'warn' logs it and serves default attributes while still refusing to overwrite it.",
+				Default: onCorruptError,
+				Examples: []fs.OptionExample{
+					{Value: onCorruptError, Help: "Fail reads and mutations for the affected directory."},
+					{Value: onCorruptWarn, Help: "Log and use default attributes, never overwriting the map."},
+				},
+			},
+			{
+				Name:    "map_max_entries",
+				Help:    "Maximum number of entries accepted in one directory map (sidecar_layout=dir; 0 = unlimited). A larger map is treated as corrupt.",
+				Default: defaultMapMaxEntries,
+			},
+			{
+				Name:    "map_max_bytes",
+				Help:    "Maximum accepted size of one directory map (sidecar_layout=dir; 0 = unlimited). A larger map is treated as corrupt.",
+				Default: fs.SizeSuffix(defaultMapMaxBytes),
 			},
 			{
 				Name:    "hide_sidecars",
 				Help:    "Hide sidecar files from directory listings.",
 				Default: true,
+			},
+			{
+				Name:    "proxy_links",
+				Help:    "Store `<name>.rclonelink` symlinks in the `symlink` attribute of the entry's single sidecar instead of uploading a payload object, and emulate the `.rclonelink` entry from that sidecar (use together with --vfs-links).",
+				Default: false,
 			},
 			{
 				Name:    "cache_ttl",
@@ -186,8 +230,13 @@ type Options struct {
 	DefaultUID         int           `config:"default_uid"`
 	DefaultGID         int           `config:"default_gid"`
 	InheritParentOwner bool          `config:"inherit_parent_owner"`
-	SidecarSuffix      string        `config:"sidecar_suffix"`
+	SidecarPrefix      string        `config:"sidecar_prefix"`
+	SidecarLayout      string        `config:"sidecar_layout"`
+	OnCorrupt          string        `config:"on_corrupt"`
+	MapMaxEntries      int           `config:"map_max_entries"`
+	MapMaxBytes        fs.SizeSuffix `config:"map_max_bytes"`
 	HideSidecars       bool          `config:"hide_sidecars"`
+	ProxyLinks         bool          `config:"proxy_links"`
 	CacheTTL           fs.Duration   `config:"cache_ttl"`
 	CacheMaxEntries    int           `config:"cache_max_entries"`
 	CacheMaxSize       fs.SizeSuffix `config:"cache_max_size"`
@@ -207,7 +256,8 @@ const maxSidecarSize = 1 << 20
 // writebackTimeout bounds a single sidecar writeback attempt.
 const writebackTimeout = 60 * time.Second
 
-// sidecarData represents the sparse JSON payload stored in <entry>.posixmeta.
+// sidecarData represents the sparse JSON payload stored in the entry's
+// `<dir>/.posixmeta.<entry>` sidecar.
 // Only fields differing from resolved defaults/inherited values are serialized.
 type sidecarData struct {
 	Version int     `json:"v"`
@@ -235,6 +285,7 @@ type resolvedMeta struct {
 // Fs.cacheLRU so the cache can be bounded without periodic scans.
 type cacheEntry struct {
 	data      *sidecarData // nil means confirmed absent on wrapped remote
+	modTime   time.Time    // modification time of the sidecar object itself
 	expiresAt time.Time
 	size      int64         // approximate memory cost used for cache_max_size
 	elem      *list.Element // list item value is the absRemote cache key
@@ -265,9 +316,10 @@ type pendingWrite struct {
 
 // inflightRead deduplicates concurrent sidecar reads of the same path.
 type inflightRead struct {
-	done chan struct{}
-	sc   *sidecarData
-	err  error
+	done    chan struct{}
+	sc      *sidecarData
+	modTime time.Time
+	err     error
 }
 
 // writebackStats counts sidecar writeback activity for the cachestats command.
@@ -299,6 +351,14 @@ type Fs struct {
 	cacheStat  cacheStats
 	reads      map[string]*inflightRead
 
+	// dir layout: cache and writeback state of the per-directory maps
+	dirMode        bool
+	maps           map[string]*mapState
+	mapsLRU        *list.List // least recently used at the front
+	mapBytes       int64
+	mapLoads       map[string]*mapLoad
+	rootMapEnsured bool
+
 	pending   map[string]*pendingWrite // absRemote -> latest debounced update
 	inflight  map[string]uint64        // absRemote -> generation being persisted
 	writeGen  uint64                   // global update sequence
@@ -322,11 +382,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if opt.Remote == "" {
 		return nil, errors.New("posixmeta: 'remote' option is required")
 	}
-	if opt.SidecarSuffix == "" {
-		opt.SidecarSuffix = defaultSuffix
+	if opt.SidecarPrefix == "" {
+		opt.SidecarPrefix = defaultSidecarPrefix
 	}
-	if strings.Contains(opt.SidecarSuffix, "/") {
-		return nil, errors.New("posixmeta: 'sidecar_suffix' must not contain '/'")
+	if strings.Contains(opt.SidecarPrefix, "/") {
+		return nil, errors.New("posixmeta: 'sidecar_prefix' must not contain '/'")
+	}
+	if legacySuffix, ok := m.Get("sidecar_suffix"); ok && legacySuffix != "" {
+		fs.Logf(nil, "posixmeta: the sidecar_suffix option was removed; sidecars are now '<prefix>.<name>' (sidecar_prefix=%q) and existing '<name>.posixmeta' files are no longer recognised", opt.SidecarPrefix)
 	}
 	switch opt.OverwriteMetadata {
 	case "":
@@ -334,6 +397,31 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	case overwriteMetadataPreserve, overwriteMetadataReset:
 	default:
 		return nil, fmt.Errorf("posixmeta: invalid overwrite_metadata %q (want %q or %q)", opt.OverwriteMetadata, overwriteMetadataPreserve, overwriteMetadataReset)
+	}
+	switch opt.SidecarLayout {
+	case "":
+		opt.SidecarLayout = layoutSparse
+	case layoutSparse, layoutDir:
+	default:
+		return nil, fmt.Errorf("posixmeta: invalid sidecar_layout %q (want %q or %q)", opt.SidecarLayout, layoutSparse, layoutDir)
+	}
+	switch opt.OnCorrupt {
+	case "":
+		opt.OnCorrupt = onCorruptError
+	case onCorruptError, onCorruptWarn:
+	default:
+		return nil, fmt.Errorf("posixmeta: invalid on_corrupt %q (want %q or %q)", opt.OnCorrupt, onCorruptError, onCorruptWarn)
+	}
+	if opt.MapMaxEntries <= 0 {
+		opt.MapMaxEntries = defaultMapMaxEntries
+	}
+	if opt.MapMaxBytes <= 0 {
+		opt.MapMaxBytes = defaultMapMaxBytes
+	}
+	if opt.SidecarLayout != layoutDir {
+		if _, ok := m.Get("map_max_entries"); ok {
+			fs.Debugf(nil, "posixmeta: map_max_entries/map_max_bytes only apply to sidecar_layout=dir")
+		}
 	}
 
 	fileMode, err := parseOctalMode(opt.DefaultFileMode, 0o644)
@@ -364,7 +452,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	wrappedFs, err := fs.NewFs(ctx, wrappedRoot)
-	if err != nil && !errors.Is(err, fs.ErrorIsFile) {
+	// A proxied symlink has no payload, so opening its exact path normally
+	// fails with ErrorObjectNotFound; the probe below decides whether it is a
+	// link instead.
+	probeLinkRoot := err == nil || errors.Is(err, fs.ErrorObjectNotFound)
+	if err != nil && !errors.Is(err, fs.ErrorIsFile) && !probeLinkRoot {
 		return nil, fmt.Errorf("posixmeta: failed to open wrapped remote %q: %w", wrappedRoot, err)
 	}
 
@@ -375,6 +467,41 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	actualRoot := root
 	if errors.Is(err, fs.ErrorIsFile) {
 		actualRoot = parentRemote(root)
+	}
+
+	// Mirror the same file-root behaviour for proxied symlinks: they have no
+	// payload object, so the wrapped backend cannot report fs.ErrorIsFile for
+	// them. Probe the sidecar and re-root the wrapped remote at the parent.
+	linkFile := false
+	if !errors.Is(err, fs.ErrorIsFile) && probeLinkRoot && opt.ProxyLinks && root != "" && isLinkRemote(root) {
+		probeFs, probeErr := fs.NewFs(ctx, opt.Remote)
+		if probeErr != nil {
+			return nil, fmt.Errorf("posixmeta: failed to open sidecar base remote %q: %w", opt.Remote, probeErr)
+		}
+		probeTarget := strings.TrimSuffix(root, fs.LinkSuffix)
+		var sc *sidecarData
+		var scErr error
+		if opt.SidecarLayout == layoutDir {
+			sc, _, scErr = readMapEntryRaw(ctx, probeFs, opt.SidecarPrefix, probeTarget)
+		} else {
+			sc, _, scErr = readSidecarObject(ctx, probeFs, sidecarPathFor(opt.SidecarPrefix, probeTarget))
+		}
+		if scErr == nil && sc != nil && sc.Symlink != "" {
+			parent := parentRemote(root)
+			parentRoot := opt.Remote
+			if parent != "" {
+				parentRoot = joinRootRemote(opt.Remote, parent)
+			}
+			wrappedFs, err = fs.NewFs(ctx, parentRoot)
+			if err != nil && !errors.Is(err, fs.ErrorIsFile) {
+				return nil, fmt.Errorf("posixmeta: failed to open wrapped remote %q: %w", parentRoot, err)
+			}
+			actualRoot = parent
+			linkFile = true
+		}
+	}
+	if !linkFile && !errors.Is(err, fs.ErrorIsFile) && err != nil {
+		return nil, fmt.Errorf("posixmeta: failed to open wrapped remote %q: %w", wrappedRoot, err)
 	}
 
 	f := &Fs{
@@ -395,6 +522,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		ready:           make(chan string, max(4, 4*opt.WritebackWorkers)),
 		stopCh:          make(chan struct{}),
 		notify:          make(chan struct{}),
+		dirMode:         opt.SidecarLayout == layoutDir,
+		maps:            make(map[string]*mapState),
+		mapsLRU:         list.New(),
+		mapLoads:        make(map[string]*mapLoad),
 	}
 
 	// When rooted at a subdirectory, sidecars for the root entry itself and for
@@ -406,6 +537,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			return nil, fmt.Errorf("posixmeta: failed to open sidecar base remote %q: %w", opt.Remote, baseErr)
 		}
 		f.base = baseFs
+	}
+
+	// Refuse to operate on a remote written by the other layout: their metadata
+	// is not interoperable and silently ignoring it would show wrong ownership.
+	if layoutErr := f.detectLayout(ctx); layoutErr != nil {
+		return nil, layoutErr
 	}
 
 	f.features = (&fs.Features{
@@ -460,6 +597,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	f.registerExitFlush()
 
+	if linkFile {
+		return f, fs.ErrorIsFile
+	}
 	return f, err
 }
 
@@ -519,36 +659,118 @@ func joinRootRemote(root, remote string) string {
 	}
 }
 
-func (f *Fs) sidecarRemote(remote string) string {
-	clean := strings.TrimSuffix(remote, "/")
-	return clean + f.opt.SidecarSuffix
+// sidecarPathFor returns the sidecar path for a remote relative to the wrapped
+// base root. Sidecars live in the same directory as their entry and carry the
+// entry name after the prefix, e.g. "dir/name" -> "dir/.posixmeta.name".
+//
+// The base root entry ("") is the one exception: it is a directory with no name
+// inside its own tree, so its sidecar is the bare prefix stored *inside* that
+// directory ("<base>/.posixmeta"). Its parent is outside the configured remote
+// (for pcloud/crypt roots it may be the account root), so writing
+// "<parent>/.posixmeta.<name>" there would escape the configured remote and a
+// `purge` of the root could not clean it up. Any other root keeps the normal
+// form: an Fs rooted at "dir" stores dir's attributes in "<base>/.posixmeta.dir".
+// The bare prefix stays unambiguous because sidecarTarget only maps
+// "<prefix>.<name>" back to an entry, so listings never synthesise a visible
+// entry for it.
+func sidecarPathFor(prefix, absRemote string) string {
+	clean := strings.Trim(strings.TrimSuffix(absRemote, "/"), "/")
+	if clean == "" {
+		return prefix
+	}
+	dir, base := path.Split(clean)
+	return dir + prefix + "." + base
 }
 
+func (f *Fs) sidecarRemote(remote string) string {
+	return sidecarPathFor(f.opt.SidecarPrefix, remote)
+}
+
+// isSidecar reports whether remote names a sidecar rather than a user entry.
 func (f *Fs) isSidecar(remote string) bool {
-	return strings.HasSuffix(remote, f.opt.SidecarSuffix)
+	base := path.Base(strings.TrimSuffix(remote, "/"))
+	return base == f.opt.SidecarPrefix || strings.HasPrefix(base, f.opt.SidecarPrefix+".")
+}
+
+// sidecarTarget returns the entry a sidecar belongs to. Sidecars and their
+// entries share a directory, so this is a purely local mapping. ok is false for
+// non-sidecars and for the base root's own sidecar, which has no entry name.
+func (f *Fs) sidecarTarget(remote string) (target string, ok bool) {
+	if f.dirMode {
+		return "", false // the dir layout has no per-entry sidecars
+	}
+	clean := strings.Trim(strings.TrimSuffix(remote, "/"), "/")
+	base := path.Base(clean)
+	prefix := f.opt.SidecarPrefix + "."
+	if !strings.HasPrefix(base, prefix) {
+		return "", false
+	}
+	name := strings.TrimPrefix(base, prefix)
+	if name == "" {
+		return "", false
+	}
+	dir := path.Dir(clean)
+	if dir == "." {
+		return name, true
+	}
+	return dir + "/" + name, true
+}
+
+// isLinkRemote reports whether remote is a rclone link object name.
+func isLinkRemote(remote string) bool {
+	return strings.HasSuffix(remote, fs.LinkSuffix)
 }
 
 // List lists objects and directories, hiding sidecar files and wrapping returned entries.
 //
-// The raw listing already contains the <entry>.posixmeta siblings, so it is used
-// to prime the sidecar cache: entries without a sidecar are remembered as
-// "absent" for free and the sidecars that do exist are fetched concurrently
-// while the listing is being wrapped. That removes most of the per-entry remote
-// round-trips that a stat on a large directory would otherwise cost.
+// The raw listing already contains the sibling sidecars, so it is used to prime
+// the sidecar cache: entries without a sidecar are remembered as "absent" for
+// free and the sidecars that do exist are fetched concurrently while the listing
+// is being wrapped. That removes most of the per-entry remote round-trips that a
+// stat on a large directory would otherwise cost.
+//
+// With proxy_links the same listing is enough to materialise symlinks: a sidecar
+// whose entry has no payload but carries a `symlink` attribute is published as
+// the `<name>.rclonelink` object the VFS expects.
 func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
+	if f.dirMode {
+		return f.listMap(ctx, dir)
+	}
 	entries, err := f.wrapped.List(ctx, dir)
 	if err != nil {
 		return nil, err
 	}
-
-	present := make(map[string]struct{}, len(entries))
-	for _, entry := range entries {
-		if remote := entry.Remote(); f.isSidecar(remote) {
-			present[strings.TrimSuffix(remote, f.opt.SidecarSuffix)] = struct{}{}
-		}
+	if err := f.checkDirEvidence(entries); err != nil {
+		return nil, err
 	}
 
-	out := make(fs.DirEntries, 0, len(entries))
+	present := make(map[string]struct{}, len(entries))
+	sidecarFor := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		remote := entry.Remote()
+		if f.isSidecar(remote) {
+			if target, ok := f.sidecarTarget(remote); ok {
+				sidecarFor[target] = remote
+			}
+			continue
+		}
+		present[remote] = struct{}{}
+	}
+
+	var links map[string]sidecarLink
+	if f.opt.ProxyLinks {
+		candidates := make(map[string]struct{}, len(sidecarFor))
+		for target := range sidecarFor {
+			if _, ok := present[target]; !ok {
+				candidates[target] = struct{}{} // no payload: may be a proxied link
+			} else if _, ok := present[target+fs.LinkSuffix]; ok {
+				candidates[target] = struct{}{} // sidecar may shadow a real link payload
+			}
+		}
+		links = f.resolveLinkCandidates(ctx, candidates)
+	}
+
+	out := make(fs.DirEntries, 0, len(entries)+len(links))
 	var prefetch []string
 	for _, entry := range entries {
 		remote := entry.Remote()
@@ -558,10 +780,16 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 			}
 		} else {
 			absRemote := f.absRemote(remote)
-			if _, ok := present[remote]; ok {
+			if _, ok := sidecarFor[remote]; ok {
 				prefetch = append(prefetch, absRemote)
 			} else {
 				f.primeNegative(absRemote)
+			}
+			if isLinkRemote(remote) {
+				if _, shadowed := links[strings.TrimSuffix(remote, fs.LinkSuffix)]; shadowed {
+					// A proxied symlink takes precedence over a stale payload.
+					continue
+				}
 			}
 		}
 		switch x := entry.(type) {
@@ -573,6 +801,16 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 			out = append(out, entry)
 		}
 	}
+	if len(links) > 0 {
+		targets := make([]string, 0, len(links))
+		for target := range links {
+			targets = append(targets, target)
+		}
+		sort.Strings(targets)
+		for _, target := range targets {
+			out = append(out, f.newLinkObjectFromSidecar(links[target]))
+		}
+	}
 	f.prefetchSidecars(ctx, prefetch)
 	return out, nil
 }
@@ -580,13 +818,48 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 // ListR lists dir recursively, hiding sidecars and wrapping the returned
 // entries. It delegates to the wrapped backend's ListR so recursive walks (copy,
 // check, size, ncdu) keep the wrapped backend's bulk-listing performance.
+//
+// Recursive batches can split a directory, so sidecar presence is resolved from
+// the cache (warmed by List and by the sidecars in the batch) instead of from
+// "no sibling sidecar in this batch".
 func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) error {
+	if f.dirMode {
+		return f.listRMap(ctx, dir, callback)
+	}
+	seenLinks := make(map[string]struct{})
 	wrapped := func(entries fs.DirEntries) error {
-		out := make(fs.DirEntries, 0, len(entries))
+		if err := f.checkDirEvidence(entries); err != nil {
+			return err
+		}
+		var links map[string]sidecarLink
+		if f.opt.ProxyLinks {
+			candidates := make(map[string]struct{}, len(entries))
+			for _, entry := range entries {
+				remote := entry.Remote()
+				if f.isSidecar(remote) {
+					if target, ok := f.sidecarTarget(remote); ok {
+						candidates[target] = struct{}{}
+					}
+					continue
+				}
+				if isLinkRemote(remote) {
+					if target := strings.TrimSuffix(remote, fs.LinkSuffix); target != "" {
+						candidates[target] = struct{}{}
+					}
+				}
+			}
+			links = f.resolveLinkCandidates(ctx, candidates)
+		}
+
+		out := make(fs.DirEntries, 0, len(entries)+len(links))
 		for _, entry := range entries {
 			remote := entry.Remote()
 			if f.isSidecar(remote) {
 				if f.opt.HideSidecars {
+					continue
+				}
+			} else if isLinkRemote(remote) {
+				if _, shadowed := links[strings.TrimSuffix(remote, fs.LinkSuffix)]; shadowed {
 					continue
 				}
 			}
@@ -597,6 +870,21 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 				out = append(out, f.wrapDirectory(x))
 			default:
 				out = append(out, entry)
+			}
+		}
+		if len(links) > 0 {
+			targets := make([]string, 0, len(links))
+			for target := range links {
+				targets = append(targets, target)
+			}
+			sort.Strings(targets)
+			for _, target := range targets {
+				link := links[target]
+				if _, done := seenLinks[link.remote]; done {
+					continue
+				}
+				seenLinks[link.remote] = struct{}{}
+				out = append(out, f.newLinkObjectFromSidecar(link))
 			}
 		}
 		if len(out) == 0 {
@@ -678,9 +966,20 @@ func (f *Fs) parentAbs(absRemote string) string {
 }
 
 // NewObject finds the object at remote and wraps it with POSIX metadata support.
+//
+// With proxy_links a `<name>.rclonelink` remote is served from the sidecar that
+// stores the symlink target; a real payload of that name (legacy links, or a
+// file that happens to end in .rclonelink) is only used when no such sidecar
+// exists.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	if f.opt.HideSidecars && f.isSidecar(remote) {
 		return nil, fs.ErrorObjectNotFound
+	}
+	if f.opt.ProxyLinks && isLinkRemote(remote) {
+		obj, err := f.newLinkObject(ctx, remote)
+		if err != nil || obj != nil {
+			return obj, err
+		}
 	}
 	obj, err := f.wrapped.NewObject(ctx, remote)
 	if err != nil {
@@ -704,6 +1003,10 @@ func (f *Fs) putObject(ctx context.Context, in io.Reader, src fs.ObjectInfo, opt
 	remote := src.Remote()
 	if f.opt.HideSidecars && f.isSidecar(remote) {
 		return nil, fmt.Errorf("posixmeta: cannot write directly to sidecar path %q", remote)
+	}
+	// A symlink is stored in its sidecar, not as a payload object.
+	if f.opt.ProxyLinks && isLinkRemote(remote) {
+		return f.putLink(ctx, in, src, options, remote)
 	}
 
 	var (
@@ -811,6 +1114,10 @@ func (f *Fs) MkdirMetadata(ctx context.Context, dir string, metadata fs.Metadata
 // It preserves the wrapped backend's server-side copy instead of degrading to a
 // download plus re-upload.
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	if lo, ok := src.(*posixLinkObject); ok && f.opt.ProxyLinks {
+		return f.copyLink(ctx, lo, remote)
+	}
+
 	doCopy := f.wrapped.Features().Copy
 	if doCopy == nil {
 		return nil, fs.ErrorCantCopy
@@ -839,7 +1146,13 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	// replaced, so it must not be written on top of the copied metadata.
 	f.quiesceAbs(ctx, dstAbs)
 
-	sc, err := readSidecarObject(ctx, srcBase, f.sidecarRemote(srcAbs))
+	var sc *sidecarData
+	var modTime time.Time
+	if po, ok := src.(*posixObject); ok {
+		sc, modTime, err = po.f.getSidecarInfoAbs(ctx, joinRootRemote(po.f.root, src.Remote()))
+	} else {
+		sc, modTime, err = readSidecarObject(ctx, srcBase, f.sidecarRemote(srcAbs))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -847,7 +1160,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		if err := f.persistSidecarAbs(ctx, dstAbs, sc); err != nil {
 			return nil, fmt.Errorf("posixmeta: copy sidecar to %q: %w", remote, err)
 		}
-		f.putCache(dstAbs, sc)
+		f.putCacheAt(dstAbs, sc, modTime)
 	} else if err := f.deleteSidecarAbsImmediate(ctx, dstAbs); err != nil {
 		fs.Debugf(f, "posixmeta: cannot remove stale sidecar for %q: %v", remote, err)
 	}
@@ -861,6 +1174,9 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 // not empty" that `rclone ls` cannot explain. Those leftovers are removed and
 // the rmdir is retried once.
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	if f.dirMode {
+		return f.rmdirMap(ctx, dir)
+	}
 	f.quiesceAbs(ctx, f.absRemote(dir))
 
 	err := f.wrapped.Rmdir(ctx, dir)
@@ -883,6 +1199,8 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 }
 
 // removeOrphanSidecars deletes sidecars in dir whose payload no longer exists.
+// A sidecar that stores a proxied symlink is the entry's only storage, so it is
+// never treated as an orphan.
 func (f *Fs) removeOrphanSidecars(ctx context.Context, dir string) (removed int, err error) {
 	entries, err := f.wrapped.List(ctx, dir)
 	if err != nil {
@@ -894,12 +1212,22 @@ func (f *Fs) removeOrphanSidecars(ctx context.Context, dir string) (removed int,
 	}
 	for _, entry := range entries {
 		remote := entry.Remote()
-		if !f.isSidecar(remote) {
+		target, ok := f.sidecarTarget(remote)
+		if !ok {
 			continue
 		}
-		target := strings.TrimSuffix(remote, f.opt.SidecarSuffix)
 		if _, ok := names[target]; ok {
 			continue // the entry itself still exists, keep its metadata
+		}
+		if f.opt.ProxyLinks {
+			sc, err := f.getSidecar(ctx, target)
+			if err != nil {
+				fs.Debugf(f, "posixmeta: cannot check orphan sidecar %q: %v", remote, err)
+				continue
+			}
+			if sc != nil && sc.Symlink != "" {
+				continue // the sidecar is the proxied symlink's payload
+			}
 		}
 		obj, ok := entry.(fs.Object)
 		if !ok {
@@ -975,6 +1303,10 @@ func (f *Fs) purgeRecurse(ctx context.Context, dir string) error {
 
 // Move moves/renames an object along with its sidecar file if present.
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	if lo, ok := src.(*posixLinkObject); ok && f.opt.ProxyLinks {
+		return f.moveLink(ctx, lo, remote)
+	}
+
 	doMove := f.wrapped.Features().Move
 	if doMove == nil {
 		return nil, fs.ErrorCantMove
@@ -1000,21 +1332,13 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 
 	srcSidecar := f.sidecarRemote(srcAbs)
 	dstSidecar := f.sidecarRemote(dstAbs)
-	movedSidecar := false
-	// Sidecars are addressed relative to the wrapped base root so entries at or
-	// above this Fs root (e.g. a root-level file's own sidecar) are handled.
-	if doSidecarMove := f.base.Features().Move; doSidecarMove != nil {
-		if scObj, err := f.base.NewObject(ctx, srcSidecar); err == nil {
-			if _, mvErr := doSidecarMove(ctx, scObj, dstSidecar); mvErr != nil {
-				fs.CountError(ctx, mvErr)
-				fs.Errorf(f, "posixmeta: failed to move sidecar %q -> %q: %v", srcSidecar, dstSidecar, mvErr)
-			} else {
-				movedSidecar = true
-			}
-		}
+	movedSidecar, merr := f.moveSidecarAbs(ctx, srcAbs, dstAbs, srcSidecar, dstSidecar)
+	if merr != nil {
+		fs.CountError(ctx, merr)
+		fs.Errorf(f, "posixmeta: failed to move sidecar %q -> %q: %v", srcSidecar, dstSidecar, merr)
 	}
 	if !movedSidecar {
-		// Without a source sidecar the destination must not keep the metadata of
+		// Without source metadata the destination must not keep the metadata of
 		// the object it just replaced.
 		if derr := f.deleteSidecarAbsImmediate(ctx, dstAbs); derr != nil {
 			fs.Debugf(f, "posixmeta: cannot remove stale sidecar for %q: %v", remote, derr)
@@ -1052,12 +1376,20 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return err
 	}
 
-	// Move directory-level sidecar (<dir>.posixmeta) if one exists. Paths are
-	// base-relative so a moved root directory keeps its sidecar, which lives
-	// just outside the wrapped root.
-	if doMove := srcBase.Features().Move; doMove != nil {
-		srcSidecar := f.sidecarRemote(joinRootRemote(srcRoot, srcRemote))
-		dstSidecar := f.sidecarRemote(f.absRemote(dstRemote))
+	// Move the directory's own metadata (`<parent>/.posixmeta.<dir>` or the key in
+	// the parent directory map) if one exists. Paths are base-relative so a moved
+	// root directory keeps its metadata, which lives just outside the wrapped
+	// root.
+	srcDirAbs := joinRootRemote(srcRoot, srcRemote)
+	dstDirAbs := f.absRemote(dstRemote)
+	if srcBase == f.base {
+		if _, merr := f.moveSidecarAbs(ctx, srcDirAbs, dstDirAbs, f.sidecarRemote(srcDirAbs), f.sidecarRemote(dstDirAbs)); merr != nil {
+			fs.CountError(ctx, merr)
+			fs.Errorf(f, "posixmeta: failed to move dir sidecar %q -> %q: %v", srcDirAbs, dstDirAbs, merr)
+		}
+	} else if doMove := srcBase.Features().Move; doMove != nil {
+		srcSidecar := f.sidecarRemote(srcDirAbs)
+		dstSidecar := f.sidecarRemote(dstDirAbs)
 		if scObj, err := srcBase.NewObject(ctx, srcSidecar); err == nil {
 			if _, mvErr := doMove(ctx, scObj, dstSidecar); mvErr != nil {
 				fs.CountError(ctx, mvErr)
@@ -1161,7 +1493,7 @@ func flushLiveFs() {
 		f.mu.Lock()
 		queued := len(f.pending)
 		f.mu.Unlock()
-		if queued == 0 {
+		if queued == 0 && len(f.mapDirtyDirs()) == 0 {
 			continue
 		}
 		if err := f.flushAllPending(ctx); err != nil {
@@ -1176,6 +1508,11 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 	switch name {
 	case "cachestats":
 		return f.cacheStatsSnapshot(), nil
+	case "repair":
+		if !f.dirMode {
+			return nil, fmt.Errorf("posixmeta: repair requires sidecar_layout=dir (this remote uses %q, whose sidecars are self-contained)", layoutSparse)
+		}
+		return f.repairCommand(ctx, arg, opt)
 	case "setmeta":
 		if len(arg) < 1 {
 			return nil, errors.New("posixmeta: setmeta requires a target remote path argument")
@@ -1186,17 +1523,39 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 			meta[k] = v
 		}
 		if obj, err := f.NewObject(ctx, target); err == nil {
-			po, ok := obj.(*posixObject)
-			if !ok {
-				return nil, fmt.Errorf("posixmeta: expected *posixObject for %q", target)
+			type metadataObject interface {
+				fs.Metadataer
+				fs.SetMetadataer
 			}
-			if err := po.SetMetadata(ctx, meta); err != nil {
+			mo, ok := obj.(metadataObject)
+			if !ok {
+				return nil, fmt.Errorf("posixmeta: object %q cannot store metadata", target)
+			}
+			if err := mo.SetMetadata(ctx, meta); err != nil {
 				return nil, err
 			}
 			if flushErr := f.flushPending(ctx, target); flushErr != nil {
 				return nil, flushErr
 			}
-			return po.Metadata(ctx)
+			return mo.Metadata(ctx)
+		}
+		// A proxied symlink can be created (or edited) through setmeta when its
+		// sidecar does not exist yet.
+		if f.opt.ProxyLinks && isLinkRemote(target) {
+			if linkTarget, ok := lookupMetadata(meta, "symlink"); ok && linkTarget != "" {
+				if err := f.storeLink(ctx, target, linkTarget, meta); err != nil {
+					return nil, err
+				}
+				obj, err := f.NewObject(ctx, target)
+				if err != nil {
+					return nil, err
+				}
+				mo, ok := obj.(fs.Metadataer)
+				if !ok {
+					return nil, fmt.Errorf("posixmeta: object %q cannot report metadata", target)
+				}
+				return mo.Metadata(ctx)
+			}
 		}
 		// Fallback to directory if not an object.
 		pd := &posixDirectory{Directory: &staticDir{remote: target, when: time.Now().UTC(), fsInfo: f}, f: f}
@@ -1246,6 +1605,18 @@ func (f *Fs) getSidecar(ctx context.Context, remote string) (*sidecarData, error
 // Concurrent reads of the same path are coalesced so a burst of stat calls after
 // a cache miss costs one remote read chain instead of one per caller.
 func (f *Fs) getSidecarAbs(ctx context.Context, absRemote string) (*sidecarData, error) {
+	sc, _, err := f.getSidecarInfoAbs(ctx, absRemote)
+	return sc, err
+}
+
+// getSidecarInfoAbs is getSidecarAbs plus the modification time of the sidecar
+// object, which is the only mtime available for entries that have no payload
+// (proxied symlinks). Pending updates report the current time because their
+// object does not exist yet.
+func (f *Fs) getSidecarInfoAbs(ctx context.Context, absRemote string) (*sidecarData, time.Time, error) {
+	if f.dirMode {
+		return f.mapEntryInfo(ctx, absRemote)
+	}
 	now := time.Now()
 
 	for {
@@ -1253,17 +1624,18 @@ func (f *Fs) getSidecarAbs(ctx context.Context, absRemote string) (*sidecarData,
 		if pw, ok := f.pending[absRemote]; ok {
 			cp := cloneSidecar(pw.data)
 			f.mu.Unlock()
-			return cp, nil
+			return cp, now, nil
 		}
 		if ce, ok := f.cache[absRemote]; ok {
 			if now.Before(ce.expiresAt) {
 				cp := cloneSidecar(ce.data)
+				modTime := ce.modTime
 				if ce.elem != nil {
 					f.cacheLRU.MoveToBack(ce.elem)
 				}
 				f.cacheStat.hits++
 				f.mu.Unlock()
-				return cp, nil
+				return cp, modTime, nil
 			}
 			// Drop expired entries eagerly so cache_max_entries / cache_max_size
 			// track live entries instead of accumulating dead keys forever.
@@ -1273,9 +1645,9 @@ func (f *Fs) getSidecarAbs(ctx context.Context, absRemote string) (*sidecarData,
 			f.mu.Unlock()
 			select {
 			case <-ir.done:
-				return cloneSidecar(ir.sc), ir.err
+				return cloneSidecar(ir.sc), ir.modTime, ir.err
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, time.Time{}, ctx.Err()
 			}
 		}
 		f.cacheStat.misses++
@@ -1283,44 +1655,46 @@ func (f *Fs) getSidecarAbs(ctx context.Context, absRemote string) (*sidecarData,
 		f.reads[absRemote] = ir
 		f.mu.Unlock()
 
-		ir.sc, ir.err = f.readSidecarAbs(ctx, absRemote)
+		ir.sc, ir.modTime, ir.err = f.readSidecarAbs(ctx, absRemote)
 
 		f.mu.Lock()
 		delete(f.reads, absRemote)
 		f.mu.Unlock()
 		close(ir.done)
-		return cloneSidecar(ir.sc), ir.err
+		return cloneSidecar(ir.sc), ir.modTime, ir.err
 	}
 }
 
 // readSidecarAbs reads and parses one sidecar from the wrapped base remote and
 // primes the cache with the result (including negative results).
-func (f *Fs) readSidecarAbs(ctx context.Context, absRemote string) (*sidecarData, error) {
-	sc, err := readSidecarObject(ctx, f.base, f.sidecarRemote(absRemote))
+func (f *Fs) readSidecarAbs(ctx context.Context, absRemote string) (*sidecarData, time.Time, error) {
+	sc, modTime, err := readSidecarObject(ctx, f.base, f.sidecarRemote(absRemote))
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
-	f.putCache(absRemote, sc)
-	return sc, nil
+	f.putCacheAt(absRemote, sc, modTime)
+	return sc, modTime, nil
 }
 
 // readSidecarObject reads and parses the sidecar at scPath from base.
 //
-// It returns (nil, nil) when the sidecar does not exist or is unusable
-// (corrupt, truncated or written by a newer schema); those cases are logged and
-// counted instead of making every stat on the entry fail.
-func readSidecarObject(ctx context.Context, base fs.Fs, scPath string) (*sidecarData, error) {
+// It returns (nil, time.Time{}, nil) when the sidecar does not exist or is
+// unusable (corrupt, truncated or written by a newer schema); those cases are
+// logged and counted instead of making every stat on the entry fail. Otherwise
+// it also returns the sidecar object's modification time.
+func readSidecarObject(ctx context.Context, base fs.Fs, scPath string) (*sidecarData, time.Time, error) {
 	scObj, err := base.NewObject(ctx, scPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrorObjectNotFound) {
-			return nil, nil
+			return nil, time.Time{}, nil
 		}
-		return nil, err
+		return nil, time.Time{}, err
 	}
+	modTime := scObj.ModTime(ctx)
 
 	rc, err := scObj.Open(ctx)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	defer func() { _ = rc.Close() }()
 
@@ -1328,28 +1702,28 @@ func readSidecarObject(ctx context.Context, base fs.Fs, scPath string) (*sidecar
 	// object (which would be corrupt or hostile) into memory.
 	raw, err := io.ReadAll(io.LimitReader(rc, maxSidecarSize+1))
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	if int64(len(raw)) > maxSidecarSize {
 		err = fmt.Errorf("sidecar %q is larger than %d bytes", scPath, maxSidecarSize)
 		fs.CountError(ctx, err)
 		fs.Errorf(nil, "posixmeta: %v; ignoring it", err)
-		return nil, nil
+		return nil, time.Time{}, nil
 	}
 
 	var parsed sidecarData
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		fs.CountError(ctx, err)
 		fs.Errorf(nil, "posixmeta: corrupt sidecar JSON at %q: %v; ignoring it", scPath, err)
-		return nil, nil
+		return nil, time.Time{}, nil
 	}
 	if parsed.Version > sidecarSchemaVersion {
 		err := fmt.Errorf("sidecar %q has schema version %d, newer than supported %d", scPath, parsed.Version, sidecarSchemaVersion)
 		fs.CountError(ctx, err)
 		fs.Errorf(nil, "posixmeta: %v; ignoring it", err)
-		return nil, nil
+		return nil, time.Time{}, nil
 	}
-	return &parsed, nil
+	return &parsed, modTime, nil
 }
 
 // resolve computes the effective POSIX attributes for remote.
@@ -1502,6 +1876,9 @@ func (f *Fs) buildSparseSidecar(ctx context.Context, remote string, isDir bool, 
 // are retried in the background until they succeed, so they are never silently
 // dropped.
 func (f *Fs) scheduleSidecarUpdate(ctx context.Context, remote string, sc *sidecarData) error {
+	if f.dirMode {
+		return f.scheduleDirUpdate(ctx, remote, sc)
+	}
 	absRemote := f.absRemote(remote)
 	f.putCache(absRemote, sc)
 
@@ -1619,7 +1996,12 @@ func (f *Fs) writebackOnce(absRemote string) {
 	f.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), writebackTimeout)
-	err := f.persistSidecarAbs(ctx, absRemote, data)
+	var err error
+	if f.dirMode {
+		err = f.mapWrite(ctx, absRemote) // absRemote is the map directory in this layout
+	} else {
+		err = f.persistSidecarAbs(ctx, absRemote, data)
+	}
 	cancel()
 	f.finishWriteback(ctx, absRemote, gen, err)
 }
@@ -1694,13 +2076,34 @@ func (f *Fs) notifyLocked() {
 
 // flushPending synchronously persists any debounced update for remote.
 func (f *Fs) flushPending(ctx context.Context, remote string) error {
-	return f.flushPendingAbs(ctx, f.absRemote(remote))
+	return f.flushPendingAbs(ctx, f.writeUnit(f.absRemote(remote)))
 }
 
 // flushPendingAbs synchronously persists the pending update for absRemote,
 // waiting for an in-flight writeback of the same path first so updates are
 // applied in order. Failures leave the update queued for retry.
 func (f *Fs) flushPendingAbs(ctx context.Context, absRemote string) error {
+	if f.dirMode {
+		for {
+			st, err := f.mapStateFor(ctx, absRemote)
+			if err != nil {
+				return err
+			}
+			f.mu.Lock()
+			dirty := st.dirty()
+			f.mu.Unlock()
+			if !dirty {
+				f.cancelPendingAbs(absRemote)
+				return nil
+			}
+			if err := f.waitInflight(ctx, absRemote); err != nil {
+				return err
+			}
+			if err := f.mapWrite(ctx, absRemote); err != nil {
+				return err
+			}
+		}
+	}
 	for {
 		f.mu.Lock()
 		pw, queued := f.pending[absRemote]
@@ -1738,6 +2141,9 @@ func (f *Fs) flushPendingAbs(ctx context.Context, absRemote string) error {
 // flushAllPending persists every queued update. It is used by CleanUp and
 // Shutdown, and by tests; updates that fail stay queued for the retry loop.
 func (f *Fs) flushAllPending(ctx context.Context) error {
+	if f.dirMode {
+		return f.flushAllMaps(ctx)
+	}
 	f.mu.Lock()
 	remotes := make([]string, 0, len(f.pending))
 	for r := range f.pending {
@@ -1844,6 +2250,7 @@ func (f *Fs) waitInflight(ctx context.Context, absRemote string) error {
 // writeback of it, so a following move or delete cannot race a stale write that
 // would resurrect or overwrite the sidecar.
 func (f *Fs) quiesceAbs(ctx context.Context, absRemote string) {
+	absRemote = f.writeUnit(absRemote)
 	f.cancelPendingAbs(absRemote)
 	if err := f.waitInflight(ctx, absRemote); err != nil {
 		fs.Debugf(f, "posixmeta: writeback for %q still in flight: %v", absRemote, err)
@@ -1889,6 +2296,13 @@ func (f *Fs) cancelPendingPrefix(dir string) {
 
 // persistSidecarAbs writes (or deletes) the sidecar for an absolute path.
 func (f *Fs) persistSidecarAbs(ctx context.Context, absRemote string, sc *sidecarData) error {
+	if f.dirMode {
+		changed, err := f.mapApply(ctx, absRemote, sc, time.Now())
+		if err != nil || !changed {
+			return err
+		}
+		return f.mapWrite(ctx, f.mapDirOf(absRemote))
+	}
 	if sc == nil {
 		return f.deleteSidecarAbsImmediate(ctx, absRemote)
 	}
@@ -1917,6 +2331,13 @@ func (f *Fs) deleteSidecarImmediate(ctx context.Context, remote string) error {
 }
 
 func (f *Fs) deleteSidecarAbsImmediate(ctx context.Context, absRemote string) error {
+	if f.dirMode {
+		changed, err := f.mapApply(ctx, absRemote, nil, time.Time{})
+		if err != nil || !changed {
+			return err
+		}
+		return f.mapWrite(ctx, f.mapDirOf(absRemote))
+	}
 	f.invalidateCacheAbs(absRemote)
 	scPath := f.sidecarRemote(absRemote)
 	scObj, err := f.base.NewObject(ctx, scPath)
@@ -1946,8 +2367,16 @@ func cacheEntrySize(absRemote string, sc *sidecarData) int64 {
 }
 
 func (f *Fs) putCache(absRemote string, sc *sidecarData) {
+	f.putCacheAt(absRemote, sc, time.Now())
+}
+
+// putCacheAt is putCache with an explicit sidecar modification time.
+func (f *Fs) putCacheAt(absRemote string, sc *sidecarData, modTime time.Time) {
+	if f.dirMode {
+		return // the map state already holds the update
+	}
 	f.mu.Lock()
-	f.putCacheLocked(absRemote, sc)
+	f.putCacheLocked(absRemote, sc, modTime)
 	evicted, entries, bytes := f.evictCacheLocked(absRemote)
 	f.mu.Unlock()
 
@@ -1959,7 +2388,7 @@ func (f *Fs) putCache(absRemote string, sc *sidecarData) {
 
 // putCacheLocked inserts or refreshes one cache entry. It is split from putCache
 // so callers that already hold f.mu (listing priming) do not need to re-lock.
-func (f *Fs) putCacheLocked(absRemote string, sc *sidecarData) {
+func (f *Fs) putCacheLocked(absRemote string, sc *sidecarData, modTime time.Time) {
 	ttl := time.Duration(f.opt.CacheTTL)
 	if ttl <= 0 {
 		return
@@ -1971,6 +2400,7 @@ func (f *Fs) putCacheLocked(absRemote string, sc *sidecarData) {
 	if ce, ok := f.cache[absRemote]; ok {
 		f.cacheBytes += size - ce.size
 		ce.data = data
+		ce.modTime = modTime
 		ce.expiresAt = expiresAt
 		ce.size = size
 		if ce.elem != nil {
@@ -1981,6 +2411,7 @@ func (f *Fs) putCacheLocked(absRemote string, sc *sidecarData) {
 	elem := f.cacheLRU.PushBack(absRemote)
 	f.cache[absRemote] = &cacheEntry{
 		data:      data,
+		modTime:   modTime,
 		expiresAt: expiresAt,
 		size:      size,
 		elem:      elem,
@@ -1992,6 +2423,9 @@ func (f *Fs) putCacheLocked(absRemote string, sc *sidecarData) {
 // obtained from a directory listing instead of a per-entry remote read. A live
 // positive entry is never downgraded.
 func (f *Fs) primeNegative(absRemote string) {
+	if f.dirMode {
+		return // maps are cached as a whole by mapStateFor
+	}
 	if f.opt.CacheTTL <= 0 {
 		return
 	}
@@ -2000,7 +2434,7 @@ func (f *Fs) primeNegative(absRemote string) {
 	if ce, ok := f.cache[absRemote]; ok && time.Now().Before(ce.expiresAt) {
 		return
 	}
-	f.putCacheLocked(absRemote, nil)
+	f.putCacheLocked(absRemote, nil, time.Time{})
 	f.evictCacheLocked(absRemote)
 }
 
@@ -2010,6 +2444,9 @@ func (f *Fs) primeNegative(absRemote string) {
 // The work is bounded both in concurrency (prefetch_workers) and in total size,
 // and failures are ignored because the on-demand path retries and reports them.
 func (f *Fs) prefetchSidecars(ctx context.Context, absRemotes []string) {
+	if f.dirMode {
+		return // one map read already covers the whole directory
+	}
 	n := f.opt.PrefetchWorkers
 	if n <= 0 || len(absRemotes) == 0 || f.opt.CacheTTL <= 0 {
 		return
@@ -2110,6 +2547,13 @@ func (f *Fs) invalidateCache(remote string) {
 }
 
 func (f *Fs) invalidateCacheAbs(absRemote string) {
+	if f.dirMode {
+		// The map of the entry's directory holds its attributes, and a directory
+		// entry has a map of its own.
+		f.mapDrop(f.mapDirOf(absRemote))
+		f.mapDrop(absRemote)
+		return
+	}
 	f.mu.Lock()
 	f.removeCacheEntryLocked(absRemote)
 	f.mu.Unlock()
@@ -2117,6 +2561,11 @@ func (f *Fs) invalidateCacheAbs(absRemote string) {
 
 func (f *Fs) invalidatePrefix(dir string) {
 	prefix := f.absRemote(strings.TrimSuffix(dir, "/"))
+	if f.dirMode {
+		// Everything under prefix is gone or moved, including unflushed state.
+		f.mapDiscardPrefix(prefix)
+		return
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if prefix == "" {
@@ -2134,6 +2583,11 @@ func (f *Fs) invalidatePrefix(dir string) {
 // dir's own entry. Owner changes only affect descendants, so this avoids
 // throwing away the entry that was just written.
 func (f *Fs) invalidateSubtree(dir string) {
+	if f.dirMode {
+		// Resolution walks the maps on every call, so nothing per-entry is cached
+		// below dir; the map that changed was already updated in memory.
+		return
+	}
 	prefix := f.absRemote(strings.TrimSuffix(dir, "/"))
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -2159,11 +2613,26 @@ func (f *Fs) invalidateSubtree(dir string) {
 func (f *Fs) cacheStatsSnapshot() map[string]any {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	corruptMaps := 0
+	dirtyMaps := 0
+	for _, st := range f.maps {
+		if st.corrupt != nil {
+			corruptMaps++
+		}
+		if st.dirty() {
+			dirtyMaps++
+		}
+	}
 	return map[string]any{
+		"layout":           f.opt.SidecarLayout,
 		"entries":          len(f.cache),
 		"bytes":            f.cacheBytes,
 		"max_entries":      f.opt.CacheMaxEntries,
 		"max_bytes":        int64(f.opt.CacheMaxSize),
+		"maps":             len(f.maps),
+		"maps_bytes":       f.mapBytes,
+		"corrupt_maps":     corruptMaps,
+		"dirty_maps":       dirtyMaps,
 		"hits":             f.cacheStat.hits,
 		"misses":           f.cacheStat.misses,
 		"evictions":        f.cacheStat.evictions,

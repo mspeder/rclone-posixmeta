@@ -216,14 +216,14 @@ _pm_config_pm_section() {
 		[default_uid]=1000
 		[default_gid]=1000
 		[inherit_parent_owner]=true
-		[sidecar_suffix]=.posixmeta
+		[sidecar_prefix]=.posixmeta
 		[hide_sidecars]=true
 		[cache_ttl]=5m
 		[writeback_delay]=50ms
 	)
 	local -a order=(
 		default_file_mode default_dir_mode default_uid default_gid
-		inherit_parent_owner sidecar_suffix hide_sidecars cache_ttl
+		inherit_parent_owner sidecar_prefix hide_sidecars cache_ttl
 		writeback_delay
 	)
 	local key known k
@@ -287,13 +287,34 @@ pm_write_crypt_config() {
 # ---------------------------------------------------------------------------
 
 # pm_sidecar_path <remote-relative-path> — echo expected on-disk sidecar path.
+# Sidecars live next to their entry and carry the entry name after the prefix:
+# dir/file -> dir/.posixmeta.file
 pm_sidecar_path() {
-	printf '%s/%s.posixmeta\n' "$PM_SRC" "$1"
+	local remote=$1 dir base
+	dir=$(dirname "$remote")
+	base=$(basename "$remote")
+	if [[ $dir == "." ]]; then
+		printf '%s/.posixmeta.%s\n' "$PM_SRC" "$base"
+	else
+		printf '%s/%s/.posixmeta.%s\n' "$PM_SRC" "$dir" "$base"
+	fi
 }
 
 # pm_sidecar_json <remote-relative-path> — echo raw sidecar JSON.
 pm_sidecar_json() {
 	cat "$(pm_sidecar_path "$1")"
+}
+
+# pm_dir_map_path <remote-relative-dir> — echo the aggregate map path of a
+# directory in the dir layout ("" or "." is the remote root).
+pm_dir_map_path() {
+	local dir=${1:-}
+	dir=${dir#./}
+	if [[ -z $dir || $dir == "." ]]; then
+		printf '%s/.posixmeta\n' "$PM_SRC"
+	else
+		printf '%s/%s/.posixmeta\n' "$PM_SRC" "${dir%/}"
+	fi
 }
 
 # pm_meta_of <parent-remote> <entry-name> <metadata-key>
@@ -359,7 +380,7 @@ pm_dir_is_empty() {
 # pm_assert_raw_has_no_plaintext <marker>
 pm_assert_raw_has_no_plaintext() {
 	local marker=$1 hits
-	hits=$(find "$PM_SRC" \( -name "*${marker}*" -o -name '*.posixmeta' \) \
+	hits=$(find "$PM_SRC" \( -name "*${marker}*" -o \( -name '.posixmeta' -o -name '.posixmeta.*' \) \) \
 		-print -quit 2>/dev/null || true)
 	[[ -z $hits ]] || pm_fail "plaintext name or sidecar leaked into raw storage: $hits"
 }
@@ -367,7 +388,7 @@ pm_assert_raw_has_no_plaintext() {
 # pm_assert_mount_has_no_sidecars <mountpoint>
 pm_assert_mount_has_no_sidecars() {
 	local mnt=$1 hits
-	hits=$(find "$mnt" -name '*.posixmeta' -print -quit 2>/dev/null || true)
+	hits=$(find "$mnt" \( -name '.posixmeta' -o -name '.posixmeta.*' \) -print -quit 2>/dev/null || true)
 	[[ -z $hits ]] || pm_fail "sidecar leaked into FUSE mount: $hits"
 }
 

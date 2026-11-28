@@ -1,0 +1,114 @@
+--- a/vfs/dir.go
++++ b/vfs/dir.go
+@@ -1121,6 +1121,39 @@
+ 	return dir, nil
+ }
+ 
++// CreateSymlink creates leaf in this directory as a symbolic link to oldname.
++//
++// It returns EEXIST if leaf already exists and ENOSYS if --links is not set.
++func (d *Dir) CreateSymlink(oldname, leaf string) (Node, error) {
++	if !d.vfs.Opt.Links {
++		fs.Errorf(d.path, "symlinks not supported without the --links flag")
++		return nil, ENOSYS
++	}
++	// Destination can't exist
++	if _, err := d.Stat(leaf); err == nil {
++		return nil, EEXIST
++	} else if err != ENOENT {
++		return nil, err
++	}
++	// Create the file node
++	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC | o_SYMLINK
++	file, err := d.Create(leaf, flags)
++	if err != nil {
++		return nil, err
++	}
++	// Force the file to be a link
++	file.setSymlink()
++	// Open the file
++	fh, err := file.Open(flags)
++	if err != nil {
++		return nil, err
++	}
++	defer fs.CheckClose(fh, &err)
++	// Write the symlink data
++	_, err = fh.Write([]byte(strings.ReplaceAll(oldname, "\\", "/")))
++	return file, nil
++}
++
+ // Remove the directory
+ func (d *Dir) Remove() error {
+ 	if d.vfs.Opt.ReadOnly {
+--- a/vfs/vfs.go
++++ b/vfs/vfs.go
+@@ -986,41 +986,13 @@
+ 		return nil, ENOSYS
+ 	}
+ 
+-	// Destination can't exist
+-	_, err := vfs.Stat(newname)
+-	if err == nil {
+-		return nil, EEXIST
+-	} else if err != ENOENT {
+-		return nil, err
+-	}
+-
+ 	// Find the parent
+ 	dir, leaf, err := vfs.StatParent(newname)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	// Create the file node
+-	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC | o_SYMLINK
+-	file, err := dir.Create(leaf, flags)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	// Force the file to be a link
+-	file.setSymlink()
+-
+-	// Open the file
+-	fh, err := file.Open(flags)
+-	if err != nil {
+-		return nil, err
+-	}
+-	defer fs.CheckClose(fh, &err)
+-
+-	// Write the symlink data
+-	_, err = fh.Write([]byte(strings.ReplaceAll(oldname, "\\", "/")))
+-
+-	return file, nil
++	return dir.CreateSymlink(oldname, leaf)
+ }
+ 
+ // Symlink creates newname as a symbolic link to oldname.
+--- a/cmd/mount/dir.go
++++ b/cmd/mount/dir.go
+@@ -7,7 +7,6 @@
+ 	"fmt"
+ 	"io"
+ 	"os"
+-	"path"
+ 	"syscall"
+ 	"time"
+ 
+@@ -253,10 +252,12 @@
+ func (d *Dir) Symlink(ctx context.Context, req *fuse.SymlinkRequest) (node fusefs.Node, err error) {
+ 	defer log.Trace(d, "newname=%v, target=%v", req.NewName, req.Target)("node=%v, err=%v", &node, &err)
+ 
+-	newName := path.Join(d.Path(), req.NewName)
+-	target := req.Target
+-
+-	n, err := d.VFS().CreateSymlink(target, newName)
++	// Create the link in this node's own directory instead of going through
++	// VFS.CreateSymlink, which re-resolves the parent through the VFS tree.
++	// After a directory cache forget that may return a different *vfs.Dir
++	// instance, so the new virtual entry would be invisible to this node's
++	// ReadDirAll until its listing is refreshed from the backend.
++	n, err := d.Dir.CreateSymlink(req.Target, req.NewName)
+ 	if err != nil {
+ 		return nil, err
+ 	}

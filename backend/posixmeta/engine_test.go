@@ -129,7 +129,7 @@ func TestWritebackRetriesUntilSuccess(t *testing.T) {
 		t.Fatalf("scheduleSidecarUpdate: %v", err)
 	}
 
-	sidecarPath := filepath.Join(rawDir, "d", "x.txt"+defaultSuffix)
+	sidecarPath := filepath.Join(rawDir, sidecarRel("d/x.txt"))
 	waitFor(t, 10*time.Second, "sidecar to be written after retries", func() bool {
 		_, err := os.Stat(sidecarPath)
 		return err == nil
@@ -223,7 +223,7 @@ func TestPendingCancelledOnRemove(t *testing.T) {
 		t.Fatalf("flushAllPending: %v", err)
 	}
 
-	if _, err := os.Stat(filepath.Join(rawDir, "f.txt"+defaultSuffix)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(rawDir, sidecarRel("f.txt"))); !os.IsNotExist(err) {
 		t.Fatalf("sidecar must not be resurrected after Remove (stat err=%v)", err)
 	}
 	f.mu.Lock()
@@ -242,7 +242,7 @@ func TestShutdownFlushesPending(t *testing.T) {
 	if err := f.scheduleSidecarUpdate(ctx, "x.txt", &sidecarData{Version: sidecarSchemaVersion, Mode: "0700"}); err != nil {
 		t.Fatalf("scheduleSidecarUpdate: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(rawDir, "x.txt"+defaultSuffix)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(rawDir, sidecarRel("x.txt"))); !os.IsNotExist(err) {
 		t.Fatalf("sidecar must still be debounced before Shutdown (stat err=%v)", err)
 	}
 
@@ -288,7 +288,7 @@ func TestPendingCapFallsBackToSync(t *testing.T) {
 	if sc := readSidecar(t, rawDir, "b.txt"); sc.Mode != "0750" {
 		t.Fatalf("overflow update was not persisted synchronously (mode=%q)", sc.Mode)
 	}
-	if _, err := os.Stat(filepath.Join(rawDir, "a.txt"+defaultSuffix)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(rawDir, sidecarRel("a.txt"))); !os.IsNotExist(err) {
 		t.Fatalf("queued update must stay debounced (stat err=%v)", err)
 	}
 	f.mu.Lock()
@@ -408,10 +408,10 @@ func TestResolveIgnoresUnusableSidecars(t *testing.T) {
 	writeFile(t, filepath.Join(rawDir, "big.txt"), "hello")
 	writeFile(t, filepath.Join(rawDir, "new.txt"), "hello")
 	// Oversized (treated as corrupt rather than loaded) and future-schema.
-	if err := os.WriteFile(filepath.Join(rawDir, "big.txt"+defaultSuffix), bytes.Repeat([]byte("{"), maxSidecarSize+1), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(rawDir, sidecarRel("big.txt")), bytes.Repeat([]byte("{"), maxSidecarSize+1), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	writeFile(t, filepath.Join(rawDir, "new.txt"+defaultSuffix), `{"v":99,"mode":"0700"}`)
+	writeFile(t, filepath.Join(rawDir, sidecarRel("new.txt")), `{"v":99,"mode":"0700"}`)
 
 	f := newTestFs(t, rawDir, nil)
 	for _, remote := range []string{"big.txt", "new.txt"} {
@@ -498,7 +498,7 @@ func TestPutOverwriteMetadataPolicy(t *testing.T) {
 			if _, err := f.Put(ctx, strings.NewReader("new"), src); err != nil {
 				t.Fatalf("Put: %v", err)
 			}
-			_, statErr := os.Stat(filepath.Join(rawDir, "x.txt"+defaultSuffix))
+			_, statErr := os.Stat(filepath.Join(rawDir, sidecarRel("x.txt")))
 			if tc.wantMode == "" {
 				if !os.IsNotExist(statErr) {
 					t.Fatalf("stale sidecar survived the overwrite (stat err=%v)", statErr)
@@ -565,7 +565,7 @@ func TestListRHidesSidecars(t *testing.T) {
 	}
 	want := map[string]bool{"a.txt": true, "sub": true, "sub/b.txt": true}
 	for _, remote := range seen {
-		if strings.HasSuffix(remote, defaultSuffix) {
+		if isTestSidecar(remote) {
 			t.Fatalf("ListR leaked sidecar %q", remote)
 		}
 		delete(want, remote)

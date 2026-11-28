@@ -40,8 +40,8 @@ coverage.*
 
 # ---------------------------------------------------------------------------
 # Local rclone fork, materialised by scripts/setup-fork.sh.
-# The fork is a pristine v1.76.0 tree plus third_party/rclone-posixmeta.patch,
-# so only the patch is versioned here; run `make fork` after cloning.
+# The fork is a pristine v1.76.0 tree plus third_party/patches/*.patch,
+# so only the patches are versioned here; run `make fork` after cloning.
 # ---------------------------------------------------------------------------
 /third_party/rclone/
 

@@ -4,10 +4,10 @@ BINARY := rclone-posixmeta
 GO ?= go
 HARNESS := ./test/run.sh
 
-# Local rclone fork (not versioned): materialised from third_party/rclone-posixmeta.patch
+# Local rclone fork (not versioned): materialised from third_party/patches/*.patch
 FORK_DIR := third_party/rclone
 FORK_STAMP := $(FORK_DIR)/.posixmeta-fork
-FORK_PATCH := third_party/rclone-posixmeta.patch
+FORK_PATCHES := $(sort $(wildcard third_party/patches/*.patch))
 
 .PHONY: all build fork test test-go test-cli test-mount test-list fmt vet clean distclean
 
@@ -19,7 +19,7 @@ build: $(FORK_STAMP)
 
 fork: $(FORK_STAMP)
 
-$(FORK_STAMP): $(FORK_PATCH) scripts/setup-fork.sh go.mod
+$(FORK_STAMP): $(FORK_PATCHES) scripts/setup-fork.sh go.mod
 	./scripts/setup-fork.sh
 
 # Full harness: Go unit tests + CLI invariants + mount-over-crypt integration.

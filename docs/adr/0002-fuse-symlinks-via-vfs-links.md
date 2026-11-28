@@ -1,9 +1,11 @@
 # 0002 — FUSE symlinks via upstream `--vfs-links`
 
-* Status: Accepted
+* Status: Accepted (link storage can be moved into the sidecar by
+  `0008-proxy-link-files.md`)
 * Date: 2026-11-22
 * Supersedes: none
-* Related: `0001-fuse-chmod-chown-propagation.md`
+* Related: `0001-fuse-chmod-chown-propagation.md`,
+  `0008-proxy-link-files.md`
 
 ## Context
 

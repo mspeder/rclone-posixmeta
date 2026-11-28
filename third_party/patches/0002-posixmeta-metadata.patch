@@ -1,0 +1,670 @@
+--- a/vfs/file.go
++++ b/vfs/file.go
+@@ -5,6 +5,7 @@
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"maps"
+ 	"os"
+ 	"path"
+ 	"strings"
+@@ -59,6 +60,7 @@
+ 	nwriters         atomic.Int32                    // len(writers)
+ 	appendMode       bool                            // file was opened with O_APPEND
+ 	isLink           bool                            // file represents a symlink
++	pendingMetadata  fs.Metadata                     // POSIX metadata to apply once o becomes available
+ }
+ 
+ // newFile creates a new File
+@@ -135,6 +137,80 @@
+ 	return mode
+ }
+ 
++// Metadata returns the POSIX metadata of the file if its object supports
++// reading metadata, with any values queued by SetMetadata overlaid so getattr
++// reflects a chmod/chown issued while the file is still being written.
++//
++// It returns ENOSYS if no metadata is available.
++func (f *File) Metadata(ctx context.Context) (fs.Metadata, error) {
++	f.mu.RLock()
++	o := f.o
++	pending := maps.Clone(f.pendingMetadata)
++	f.mu.RUnlock()
++
++	var meta fs.Metadata
++	if o != nil {
++		if do, ok := o.(fs.Metadataer); ok {
++			m, err := do.Metadata(ctx)
++			if err != nil {
++				return nil, err
++			}
++			meta = m
++		}
++	}
++	meta.Merge(pending)
++	if meta == nil {
++		return nil, ENOSYS
++	}
++	return meta, nil
++}
++
++// SetMetadata sets POSIX metadata on the file via its object if it supports
++// fs.SetMetadataer. While the file is still being written the metadata is
++// queued and applied from setObject once the object exists.
++func (f *File) SetMetadata(ctx context.Context, meta fs.Metadata) error {
++	if f.d.vfs.Opt.ReadOnly {
++		return EROFS
++	}
++	if len(meta) == 0 {
++		return nil
++	}
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if f.pendingMetadata == nil {
++		f.pendingMetadata = make(fs.Metadata, len(meta))
++	}
++	for k, v := range meta {
++		f.pendingMetadata[k] = v
++	}
++	if f._writingInProgress() {
++		return nil
++	}
++	return f._applyPendingMetadata(f.ctx) // outlives the FUSE request ctx
++}
++
++// Apply pending metadata
++//
++// Call with the mutex held and the object available
++func (f *File) _applyPendingMetadata(ctx context.Context) error {
++	if len(f.pendingMetadata) == 0 {
++		return nil
++	}
++	pending := f.pendingMetadata
++	f.pendingMetadata = nil
++	do, ok := f.o.(fs.SetMetadataer)
++	if !ok {
++		return ENOSYS
++	}
++	err := do.SetMetadata(ctx, pending)
++	if err != nil {
++		fs.Errorf(f._path(), "Failed to apply pending metadata %v: %v", pending, err)
++		// Put the metadata back so a later attempt can retry.
++		f.pendingMetadata = pending
++	}
++	return err
++}
++
+ // Name (base) of the directory - satisfies Node interface
+ func (f *File) Name() (name string) {
+ 	f.mu.RLock()
+@@ -541,6 +617,7 @@
+ 	f.o = o
+ 	f._setIsLink()
+ 	_ = f._applyPendingModTime()
++	_ = f._applyPendingMetadata(f.ctx)
+ 	d := f.d
+ 	f.mu.Unlock()
+ 
+--- a/vfs/dir.go
++++ b/vfs/dir.go
+@@ -1,6 +1,7 @@
+ package vfs
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
+@@ -39,6 +40,9 @@
+ 	items   map[string]Node   // directory entries - can be empty but not nil
+ 	virtual map[string]vState // virtual directory entries - may be nil
+ 
++	// also protected by mu
++	synthetic bool // entry is a VFS placeholder (NewDir/NewDirCopy), not from the backend
++
+ 	modTimeMu sync.Mutex // protects the following
+ 	modTime   time.Time
+ 
+@@ -164,6 +168,76 @@
+ 	return os.FileMode(d.vfs.Opt.DirPerms)
+ }
+ 
++// backendEntry returns the fs.Directory backing this node.
++//
++// Synthetic entries (fs.NewDir from Mkdir/Rename) can't read or write
++// metadata, so the real directory is re-read from the parent once. Call
++// without d.mu held.
++func (d *Dir) backendEntry() fs.Directory {
++	d.mu.RLock()
++	entry, parent, dirPath, synthetic := d.entry, d.parent, d.path, d.synthetic
++	d.mu.RUnlock()
++	if entry == nil || !synthetic || parent == nil {
++		return entry
++	}
++	parentPath := path.Dir(dirPath)
++	if parentPath == "." {
++		parentPath = ""
++	}
++	entries, err := d.f.List(d.vfs.ctx, parentPath)
++	if err != nil {
++		fs.Debugf(dirPath, "Dir.backendEntry: failed to list %q: %v", parentPath, err)
++		return entry
++	}
++	for _, e := range entries {
++		dir, ok := e.(fs.Directory)
++		if !ok || dir.Remote() != dirPath {
++			continue
++		}
++		d.mu.Lock()
++		if d.path == dirPath { // not renamed while listing
++			d.entry, d.synthetic = dir, false
++			entry = dir
++		}
++		d.mu.Unlock()
++		return entry
++	}
++	return entry
++}
++
++// Metadata returns the POSIX metadata of the directory if its
++// fs.Directory supports reading metadata.
++func (d *Dir) Metadata(ctx context.Context) (fs.Metadata, error) {
++	entry := d.backendEntry()
++	if entry == nil {
++		return nil, ENOSYS
++	}
++	if do, ok := entry.(fs.Metadataer); ok {
++		return do.Metadata(ctx)
++	}
++	return nil, ENOSYS
++}
++
++// SetMetadata sets POSIX metadata on the directory if its
++// fs.Directory supports writing metadata.
++func (d *Dir) SetMetadata(ctx context.Context, meta fs.Metadata) error {
++	if d.vfs.Opt.ReadOnly {
++		return EROFS
++	}
++	if len(meta) == 0 {
++		return nil
++	}
++	entry := d.backendEntry()
++	if entry == nil {
++		return ENOSYS
++	}
++	do, ok := entry.(fs.SetMetadataer)
++	if !ok {
++		return ENOSYS
++	}
++	return do.SetMetadata(d.vfs.ctx, meta) // outlives the FUSE request ctx
++}
++
+ // Name (base) of the directory - satisfies Node interface
+ func (d *Dir) Name() (name string) {
+ 	d.mu.RLock()
+@@ -371,6 +445,7 @@
+ 		d.path = dirPath
+ 		d.parent.items[name(d.path)] = d
+ 		d.entry = fs.NewDirCopy(d.vfs.ctx, d.entry).SetRemote(dirPath)
++		d.synthetic = true
+ 	}
+ 
+ 	// Do the same to any child directories and files
+@@ -403,6 +478,7 @@
+ 	oldPath := d.path
+ 	d.parent = newParent
+ 	d.entry = fsDir
++	d.synthetic = true
+ 	d.path = fsDir.Remote()
+ 	newPath := d.path
+ 	d.read = time.Time{}
+@@ -473,7 +549,9 @@
+ 	if isDir {
+ 		remote := path.Join(dPath, leaf)
+ 		entry := fs.NewDir(remote, time.Now())
+-		node = newDir(d.vfs, d.f, d, entry)
++		dir := newDir(d.vfs, d.f, d, entry)
++		dir.synthetic = true
++		node = dir
+ 	} else {
+ 		isLink := false
+ 		if d.vfs.Opt.Links {
+@@ -759,6 +837,7 @@
+ 			dir.mu.Lock()
+ 			dir.modTime = item.ModTime(d.vfs.ctx)
+ 			dir.entry = item
++			dir.synthetic = false
+ 			if dirTree != nil {
+ 				err = dir._readDirFromDirTree(dirTree, when)
+ 				if err != nil {
+@@ -1112,6 +1191,7 @@
+ 	}
+ 	fsDir := fs.NewDir(path, time.Now())
+ 	dir := newDir(d.vfs, d.f, d, fsDir)
++	dir.synthetic = true
+ 	d.addObject(dir)
+ 	if err = d.SetModTime(time.Now()); err != nil {
+ 		fs.Errorf(d, "Dir.Mkdir failed to set modtime on parent dir: %v", err)
+--- a/cmd/mount/mount.go
++++ b/cmd/mount/mount.go
+@@ -40,7 +40,11 @@
+ 		// options = append(options, fuse.AllowRoot())
+ 		fs.Errorf(nil, "Ignoring --allow-root. Support has been removed upstream - see https://github.com/bazil/fuse/issues/144 for more info")
+ 	}
+-	if opt.DefaultPermissions {
++	// --metadata-push reports per-entry POSIX mode/uid/gid, and without
++	// default_permissions the kernel never asks for access, so those would be
++	// cosmetic (any --allow-other user could traverse a 0700 directory).
++	// Enforce what we report unless explicitly opted out.
++	if opt.DefaultPermissions || (opt.MetadataPush && opt.MetadataPermissions) {
+ 		options = append(options, fuse.DefaultPermissions())
+ 	}
+ 	if VFS.Opt.ReadOnly {
+--- a/cmd/mount/file.go
++++ b/cmd/mount/file.go
+@@ -38,13 +38,25 @@
+ 	a.Mtime = modTime
+ 	a.Ctime = modTime
+ 	a.Blocks = Blocks
++	// Overlay per-entry POSIX metadata unless this is a symlink: its mode
++	// must stay from --link-perms (the kernel ignores chmod on links), but
++	// uid/gid still apply.
++	if f.fsys.opt.MetadataPush {
++		if meta, err := f.File.Metadata(ctx); err == nil {
++			applyPOSIXMetadata(a, meta, !f.File.IsSymlink())
++		}
++	}
+ 	return nil
+ }
+ 
+ // Check interface satisfied
+ var _ fusefs.NodeSetattrer = (*File)(nil)
+ 
+-// Setattr handles attribute changes from FUSE. Currently supports ModTime and Size only
++// Setattr handles attribute changes from FUSE.
++//
++// It supports ModTime, Size, Mode (chmod) and Uid/Gid (chown). Mode
++// and ownership are forwarded to the backend via fs.SetMetadataer if
++// it supports writing metadata.
+ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) (err error) {
+ 	defer log.Trace(f, "a=%+v", req)("err=%v", &err)
+ 	if !f.VFS().Opt.NoModTime {
+@@ -57,6 +69,9 @@
+ 	if req.Valid.Size() {
+ 		err = f.File.Truncate(int64(req.Size))
+ 	}
++	if err == nil && f.fsys.opt.MetadataPush && (req.Valid.Mode() || req.Valid.Uid() || req.Valid.Gid()) {
++		err = setattrPOSIX(ctx, f.File, req)
++	}
+ 	return translateError(err)
+ }
+ 
+--- a/cmd/mount/dir.go
++++ b/cmd/mount/dir.go
+@@ -4,6 +4,7 @@
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"os"
+@@ -38,6 +39,13 @@
+ 	a.Atime = modTime
+ 	a.Mtime = modTime
+ 	a.Ctime = modTime
++	// Override the mount defaults with per-entry POSIX metadata if
++	// --metadata-push was requested and the backend supports it.
++	if d.fsys.opt.MetadataPush {
++		if meta, err := d.Dir.Metadata(ctx); err == nil {
++			applyPOSIXMetadata(a, meta, true)
++		}
++	}
+ 	// FIXME include Valid so get some caching?
+ 	// FIXME fs.Debugf(d.path, "Dir.Attr %+v", a)
+ 	return nil
+@@ -46,9 +54,18 @@
+ // Check interface satisfied
+ var _ fusefs.NodeSetattrer = (*Dir)(nil)
+ 
+-// Setattr handles attribute changes from FUSE. Currently supports ModTime only.
++// Setattr handles attribute changes from FUSE.
++//
++// It supports ModTime, Mode (chmod) and Uid/Gid (chown). Mode and
++// ownership are forwarded to the backend via fs.SetMetadataer if it
++// supports writing metadata.
+ func (d *Dir) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) (err error) {
+ 	defer log.Trace(d, "stat=%+v", req)("err=%v", &err)
++	if d.fsys.opt.MetadataPush && (req.Valid.Mode() || req.Valid.Uid() || req.Valid.Gid()) {
++		if err = setattrPOSIX(ctx, d.Dir, req); err != nil {
++			return translateError(err)
++		}
++	}
+ 	if d.VFS().Opt.NoModTime {
+ 		return nil
+ 	}
+@@ -143,6 +160,34 @@
+ 
+ var _ fusefs.NodeCreater = (*Dir)(nil)
+ 
++// stampCreate records the creating process's uid/gid/mode on a freshly created
++// entry when --metadata-push is enabled, so stat is faithful right after
++// create/mkdir/ln, like on a regular filesystem (including the caller's umask
++// and the parent's S_ISGID for new directories). Failures are logged and
++// ignored: ENOSYS means the backend stores no POSIX metadata and must keep
++// working.
++func (d *Dir) stampCreate(ctx context.Context, node posixMetadataWriter, kind createKind, reqMode os.FileMode, uid, gid uint32) {
++	if !d.fsys.opt.MetadataPush {
++		return
++	}
++	// A file that already reports metadata is an existing object that this
++	// CREATE reopened (the kernel can send CREATE for a name whose cached
++	// dentry was negative). Keep its metadata: stamping would overwrite the
++	// recorded mode/owner with the re-opener's credentials. A genuinely new
++	// file has no object yet, so it reports no metadata.
++	if kind == createFile {
++		if r, ok := node.(posixMetadataReader); ok {
++			if meta, err := r.Metadata(ctx); err == nil && len(meta) > 0 {
++				return
++			}
++		}
++	}
++	meta := posixCreateMetadata(ctx, d.Dir, kind, reqMode, uid, gid)
++	if err := node.SetMetadata(ctx, meta); err != nil && !errors.Is(err, vfs.ENOSYS) {
++		fs.Errorf(d, "Failed to record POSIX metadata of new entry: %v", err)
++	}
++}
++
+ // Create makes a new file
+ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (node fusefs.Node, handle fusefs.Handle, err error) {
+ 	defer log.Trace(d, "name=%q", req.Name)("node=%v, handle=%v, err=%v", &node, &handle, &err)
+@@ -156,6 +201,7 @@
+ 	if err != nil {
+ 		return nil, nil, translateError(err)
+ 	}
++	d.stampCreate(ctx, file, createFile, req.Mode, req.Uid, req.Gid)
+ 	node = &File{file, d.fsys}
+ 	file.SetAux(d.fsys, node) // cache the FUSE node for later
+ 	return node, &FileHandle{fh}, err
+@@ -170,6 +216,7 @@
+ 	if err != nil {
+ 		return nil, translateError(err)
+ 	}
++	d.stampCreate(ctx, dir, createDir, req.Mode, req.Uid, req.Gid)
+ 	node = &Dir{dir, d.fsys}
+ 	dir.SetAux(d.fsys, node) // cache the FUSE node for later
+ 	return node, nil
+@@ -262,6 +309,13 @@
+ 		return nil, err
+ 	}
+ 
++	// Symlinks keep their mode from --link-perms: only ownership is
++	// recorded, so getattr shows the creating process instead of the
++	// parent directory owner.
++	if file, ok := n.(*vfs.File); ok {
++		d.stampCreate(ctx, file, createLink, 0, req.Uid, req.Gid)
++	}
++
+ 	node = &File{n.(*vfs.File), d.fsys}
+ 	return node, nil
+ }
+@@ -284,6 +338,7 @@
+ 		Mode:  req.Mode,
+ 		Umask: req.Umask,
+ 	}
++	cReq.Header = req.Header // keep the creator's uid/gid for stampCreate
+ 	var cResp fuse.CreateResponse
+ 	node, handle, err := d.Create(ctx, &cReq, &cResp)
+ 	if err != nil {
+--- a/cmd/mountlib/mount.go
++++ b/cmd/mountlib/mount.go
+@@ -46,6 +46,11 @@
+ 	Help:    "Time for which file/directory attributes are cached",
+ 	Groups:  "Mount",
+ }, {
++	Name:    "metadata_push",
++	Default: false,
++	Help:    "Push POSIX mode/uid/gid metadata to the backend and report it in getattr",
++	Groups:  "Mount",
++}, {
+ 	Name:     "option",
+ 	Default:  []string{},
+ 	Help:     "Option for libfuse/WinFsp (repeat if required)",
+@@ -79,6 +84,11 @@
+ 	Help:    "Makes kernel enforce access control based on the file mode (not supported on Windows)",
+ 	Groups:  "Mount",
+ }, {
++	Name:    "metadata_permissions",
++	Default: true,
++	Help:    "Let the kernel enforce the POSIX mode/uid/gid reported by --metadata-push for path traversal, read and write access (set --metadata-permissions=false to keep the permissive stock behaviour) (not supported on Windows)",
++	Groups:  "Mount",
++}, {
+ 	Name:    "allow_non_empty",
+ 	Default: false,
+ 	Help:    "Allow mounting over a non-empty directory (not supported on Windows)",
+@@ -195,6 +205,10 @@
+ 	NetworkMode        bool          `config:"network_mode"` // Windows only
+ 	DirectIO           bool          `config:"direct_io"`    // use Direct IO for file access
+ 	CaseInsensitive    fs.Tristate   `config:"mount_case_insensitive"`
++
++	// Per-entry POSIX metadata, see docs/adr/0001-*
++	MetadataPush        bool `config:"metadata_push"`
++	MetadataPermissions bool `config:"metadata_permissions"`
+ }
+ 
+ type (
+@@ -244,6 +258,24 @@
+ 	}
+ }
+ 
++// metadataPushRequirer is implemented by backends which store POSIX
++// mode/uid/gid metadata. Mounting such a backend without --metadata-push
++// would silently hide that metadata and drop chmod/chown, so it is
++// rejected up front instead.
++type metadataPushRequirer interface {
++	RequiresMetadataPush() bool
++}
++
++// checkMetadataPush returns an error if the backend requires
++// --metadata-push but the mount was started without it.
++func checkMetadataPush(mnt *MountPoint) error {
++	req, ok := mnt.Fs.(metadataPushRequirer)
++	if !ok || !req.RequiresMetadataPush() || mnt.MountOpt.MetadataPush {
++		return nil
++	}
++	return fmt.Errorf("backend %q stores POSIX mode/uid/gid; mount with --metadata-push to report them in stat and forward chmod/chown", mnt.Fs.Name())
++}
++
+ // Global constants
+ const (
+ 	MaxLeafSize = 1024 // don't pass file names longer than this
+@@ -327,6 +359,9 @@
+ 			}
+ 
+ 			mnt := NewMountPoint(mount, args[1], cmd.NewFsDir(args), &Opt, &vfscommon.Opt)
++			if err := checkMetadataPush(mnt); err != nil {
++				fs.Fatalf(nil, "Fatal error: %v", err)
++			}
+ 			mountDaemon, err := mnt.Mount()
+ 
+ 			// Wait for foreground mount, if any...
+--- /dev/null
++++ b/cmd/mount/posixmeta.go
+@@ -0,0 +1,177 @@
++//go:build linux
++
++package mount
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"strconv"
++	"strings"
++
++	"bazil.org/fuse"
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/vfs"
++)
++
++// applyPOSIXMetadata overrides the mount-wide default mode, uid and gid in
++// attr with per-entry POSIX metadata from the backend (so ls -l/stat show
++// what posixmeta stored instead of --file-perms/--dir-perms and --uid/--gid).
++//
++// modeFromMeta must be false for symlinks: their mode comes from
++// --link-perms (the kernel ignores chmod on links), so a stored "mode" would
++// make stat report e.g. 0644. uid/gid are still overlaid.
++func applyPOSIXMetadata(attr *fuse.Attr, meta fs.Metadata, modeFromMeta bool) {
++	if len(meta) == 0 {
++		return
++	}
++	if v, ok := meta["mode"]; ok && modeFromMeta {
++		if mode, ok := parsePOSIXMode(v); ok {
++			const permBits = os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
++			attr.Mode = (attr.Mode &^ permBits) | mode
++		}
++	}
++	if v, ok := meta["uid"]; ok {
++		if uid, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32); err == nil {
++			attr.Uid = uint32(uid)
++		}
++	}
++	if v, ok := meta["gid"]; ok {
++		if gid, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32); err == nil {
++			attr.Gid = uint32(gid)
++		}
++	}
++}
++
++// posixMetadataWriter is implemented by *vfs.File and *vfs.Dir.
++type posixMetadataWriter interface {
++	SetMetadata(ctx context.Context, meta fs.Metadata) error
++}
++
++// posixMetadataReader is implemented by *vfs.File and *vfs.Dir.
++type posixMetadataReader interface {
++	Metadata(ctx context.Context) (fs.Metadata, error)
++}
++
++// setattrPOSIX pushes the mode/uid/gid of a FUSE setattr request to the
++// backend through node.
++//
++// ENOSYS (a backend without metadata support) is swallowed to keep
++// rclone's historical behaviour of ignoring chmod/chown.
++func setattrPOSIX(ctx context.Context, node posixMetadataWriter, req *fuse.SetattrRequest) error {
++	var meta fs.Metadata
++	if req.Valid.Mode() {
++		meta.Set("mode", modeToMetadata(req.Mode))
++	}
++	if req.Valid.Uid() {
++		meta.Set("uid", strconv.FormatUint(uint64(req.Uid), 10))
++	}
++	if req.Valid.Gid() {
++		meta.Set("gid", strconv.FormatUint(uint64(req.Gid), 10))
++	}
++	if len(meta) == 0 {
++		return nil
++	}
++	err := node.SetMetadata(ctx, meta)
++	if errors.Is(err, vfs.ENOSYS) {
++		return nil
++	}
++	return err
++}
++
++// modeToMetadata converts an os.FileMode into the octal string used by
++// fs.Metadata ("0%o"), including the setuid, setgid and sticky bits.
++func modeToMetadata(mode os.FileMode) string {
++	v := uint32(mode.Perm())
++	if mode&os.ModeSetuid != 0 {
++		v |= 0o4000
++	}
++	if mode&os.ModeSetgid != 0 {
++		v |= 0o2000
++	}
++	if mode&os.ModeSticky != 0 {
++		v |= 0o1000
++	}
++	return fmt.Sprintf("0%o", v)
++}
++
++// createKind is the kind of entry being created through the mount. It decides
++// which POSIX attributes may be stamped: S_ISGID is inherited by new
++// subdirectories only, and symlinks keep their mode from --link-perms.
++type createKind int
++
++const (
++	createFile createKind = iota // regular file or device node
++	createDir                    // directory
++	createLink                   // symlink
++)
++
++// posixCreateMetadata builds the metadata to stamp on a new entry so it looks
++// like a freshly created inode on a regular filesystem:
++//
++//   - uid = the creating process;
++//   - gid = the creating process, unless the parent directory has S_ISGID (then
++//     the parent's group wins);
++//   - mode = the mode the kernel asked for (already masked by the caller's
++//     umask, because bazil/fuse doesn't negotiate FUSE_DONT_MASK), plus the
++//     parent's S_ISGID bit for new subdirectories. Regular files never inherit
++//     S_ISGID, and symlinks take their mode from --link-perms (Linux ignores
++//     chmod on links), so for createLink only uid/gid are recorded.
++//
++// Without this a fresh entry would resolve to default_uid/default_gid, the
++// parent's owner and default_file_mode/default_dir_mode instead of the
++// caller's credentials and umask.
++func posixCreateMetadata(ctx context.Context, parent *vfs.Dir, kind createKind, reqMode os.FileMode, uid, gid uint32) fs.Metadata {
++	meta := fs.Metadata{
++		"uid": strconv.FormatUint(uint64(uid), 10),
++		"gid": strconv.FormatUint(uint64(gid), 10),
++	}
++	if kind != createLink {
++		meta["mode"] = modeToMetadata(reqMode)
++	}
++	if parent == nil {
++		return meta
++	}
++	pmeta, err := parent.Metadata(ctx)
++	if err != nil {
++		return meta
++	}
++	pmode, ok := parsePOSIXMode(pmeta["mode"])
++	if !ok || pmode&os.ModeSetgid == 0 {
++		return meta
++	}
++	if pgid, err := strconv.ParseUint(strings.TrimSpace(pmeta["gid"]), 10, 32); err == nil {
++		meta["gid"] = strconv.FormatUint(pgid, 10)
++	}
++	if kind == createDir {
++		meta["mode"] = modeToMetadata(reqMode | os.ModeSetgid)
++	}
++	return meta
++}
++
++// parsePOSIXMode parses an octal mode string such as "0644" or "0o755"
++// into an os.FileMode including the setuid, setgid and sticky bits.
++func parsePOSIXMode(s string) (os.FileMode, bool) {
++	s = strings.TrimSpace(s)
++	s = strings.TrimPrefix(s, "0o")
++	s = strings.TrimPrefix(s, "0O")
++	if s == "" {
++		return 0, false
++	}
++	value, err := strconv.ParseUint(s, 8, 32)
++	if err != nil {
++		return 0, false
++	}
++	mode := os.FileMode(value & 0o777)
++	if value&0o4000 != 0 {
++		mode |= os.ModeSetuid
++	}
++	if value&0o2000 != 0 {
++		mode |= os.ModeSetgid
++	}
++	if value&0o1000 != 0 {
++		mode |= os.ModeSticky
++	}
++	return mode, true
++}

@@ -20,7 +20,7 @@ that the debounced writeback path could lose metadata:
   writeback resurrected sidecars of deleted objects (invisible orphan objects).
 * Nothing bounded the number of queued updates, ordered two writes of the same
   path, or coalesced concurrent reads of the same sidecar.
-* `List` already returns every `<entry>.posixmeta` sibling but threw that
+* `List` already returns every `<dir>/.posixmeta.<entry>` sibling but threw that
   information away, so a `stat` storm after a directory read cost one remote
   round-trip per entry (plus one per ancestor for ownership inheritance).
 * Optional wrapped-backend features (`Copy`, `ListR`, `ChangeNotify`,
@@ -63,7 +63,7 @@ The review also established that every fix could live in `backend/posixmeta`:
    writes (`quiesceAbs`/`quiescePrefix`) before touching sidecars.
 
 5. **Directory listings prime the cache.** `List` builds the set of
-   `*.posixmeta` siblings, caches "absent" for entries without one for free, and
+   `.posixmeta.*` siblings, caches "absent" for entries without one for free, and
    prefetches existing sidecars with `prefetch_workers` goroutines (capped at
    `64*prefetch_workers` entries and 30s per listing).
 

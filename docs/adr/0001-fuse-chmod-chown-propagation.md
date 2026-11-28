@@ -40,19 +40,22 @@ replace github.com/rclone/rclone => ./third_party/rclone
 
 Patch scope (kept minimal so the fork can be refreshed from upstream):
 
-* `vfs/file.go`, `vfs/dir.go` — add
-  `Metadata`/`SetMetadata`/`Chmod`/`Chown` on `File` and `Dir`.
+* `vfs/file.go`, `vfs/dir.go` — add `Metadata`/`SetMetadata` on `File` and
+  `Dir`.
   * Queued (`pendingMetadata`) writes for files that are still uploading;
     applied from `setObject`.
   * `Dir.backendEntry` refreshes synthetic `fs.NewDir` entries created by
     `Mkdir`/`Rename` from the backend so the first `chmod` after `mkdir`
     works.
-* `vfs/vfs.go` — `VFS.Chmod`/`Chown`/`Metadata` dispatch to nodes, returning
-  `ENOSYS` when the backend has no metadata support.
+  * `VFS.Chmod`/`VFS.Chown` are deliberately left untouched: they still return
+    `ENOSYS`, so every other VFS user (`rclone serve nfs`, for example) keeps
+    upstream behaviour even for backends such as `local` which implement
+    `fs.SetMetadataer`.
 * `cmd/mount/file.go`, `cmd/mount/dir.go` — overlay `mode`/`uid`/`gid` from
-  `Metadata` in `Attr`; forward `Mode`/`Uid`/`Gid` from `Setattr`, ignoring
-  `ENOSYS` so non-metadata backends keep the previous no-op behaviour. Both
-  paths are gated on the new `--metadata-push` mount option (default off).
+  `Metadata` in `Attr`; forward `Mode`/`Uid`/`Gid` from `Setattr` as
+  `SetMetadata`, ignoring `ENOSYS` so non-metadata backends keep the previous
+  no-op behaviour. Both paths are gated on the new `--metadata-push` mount
+  option (default off).
 * `cmd/mountlib/mount.go` — `--metadata-push` option, plus a preflight: a
   backend implementing `RequiresMetadataPush() bool` is rejected with a clear
   error when the mount lacks the flag. `posixmeta` returns true, so it cannot

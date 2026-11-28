@@ -50,7 +50,7 @@ func testConfig(rawDir string, extra map[string]string) configmap.Simple {
 		"default_uid":          "1000",
 		"default_gid":          "1000",
 		"inherit_parent_owner": "true",
-		"sidecar_suffix":       ".posixmeta",
+		"sidecar_prefix":       ".posixmeta",
 		"hide_sidecars":        "true",
 		"cache_ttl":            "0",
 		"writeback_delay":      "0",
@@ -106,12 +106,12 @@ func writeSidecar(t *testing.T, rawDir, remote string, sc *sidecarData) {
 	if err != nil {
 		t.Fatalf("marshal sidecar: %v", err)
 	}
-	writeFile(t, filepath.Join(rawDir, remote+defaultSuffix), string(payload))
+	writeFile(t, filepath.Join(rawDir, sidecarRel(remote)), string(payload))
 }
 
 func readSidecar(t *testing.T, rawDir, remote string) sidecarData {
 	t.Helper()
-	payload, err := os.ReadFile(filepath.Join(rawDir, remote+defaultSuffix))
+	payload, err := os.ReadFile(filepath.Join(rawDir, sidecarRel(remote)))
 	if err != nil {
 		t.Fatalf("read sidecar: %v", err)
 	}
@@ -123,6 +123,18 @@ func readSidecar(t *testing.T, rawDir, remote string) sidecarData {
 }
 
 func uint32Ptr(v uint32) *uint32 { return &v }
+
+// sidecarRel returns the sidecar path (relative to the wrapped root) of a test
+// remote, e.g. "d/x.txt" -> "d/.posixmeta.x.txt".
+func sidecarRel(remote string) string {
+	return sidecarPathFor(defaultSidecarPrefix, remote)
+}
+
+// isTestSidecar reports whether remote names a sidecar of the current layout.
+func isTestSidecar(remote string) bool {
+	base := filepath.Base(remote)
+	return base == defaultSidecarPrefix || strings.HasPrefix(base, defaultSidecarPrefix+".")
+}
 
 func TestParseOctalMode(t *testing.T) {
 	tests := []struct {
@@ -203,9 +215,9 @@ func TestNewFsValidation(t *testing.T) {
 
 	t.Run("suffix with slash", func(t *testing.T) {
 		m := base()
-		m["sidecar_suffix"] = "bad/suffix"
+		m["sidecar_prefix"] = "bad/suffix"
 		if _, err := NewFs(context.Background(), "test", "", m); err == nil {
-			t.Fatal("expected error for sidecar_suffix containing '/'")
+			t.Fatal("expected error for sidecar_prefix containing '/'")
 		}
 	})
 
@@ -374,7 +386,7 @@ func TestSetMetadataIgnoresAtimeCtimeAndReverts(t *testing.T) {
 	if !ok {
 		t.Fatalf("NewObject returned %T, want *posixObject", obj)
 	}
-	sidecarPath := filepath.Join(rawDir, "f.txt"+defaultSuffix)
+	sidecarPath := filepath.Join(rawDir, sidecarRel("f.txt"))
 
 	// atime/ctime must not produce a sidecar.
 	if err := po.SetMetadata(ctx, fs.Metadata{
@@ -420,7 +432,7 @@ func TestPutRejectsSidecarPath(t *testing.T) {
 	rawDir := t.TempDir()
 	f := newTestFs(t, rawDir, nil)
 
-	src := object.NewStaticObjectInfo("x.txt"+defaultSuffix, time.Now(), 1, true, nil, f.wrapped)
+	src := object.NewStaticObjectInfo(sidecarRel("x.txt"), time.Now(), 1, true, nil, f.wrapped)
 	_, err := f.Put(ctx, strings.NewReader("x"), src)
 	if err == nil {
 		t.Fatal("expected Put to reject a sidecar path")
@@ -428,7 +440,7 @@ func TestPutRejectsSidecarPath(t *testing.T) {
 	if !strings.Contains(err.Error(), "cannot write directly to sidecar path") {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if _, statErr := os.Stat(filepath.Join(rawDir, "x.txt"+defaultSuffix)); !os.IsNotExist(statErr) {
+	if _, statErr := os.Stat(filepath.Join(rawDir, sidecarRel("x.txt"))); !os.IsNotExist(statErr) {
 		t.Fatalf("sidecar path must not be written (stat err=%v)", statErr)
 	}
 }
@@ -437,8 +449,8 @@ func TestListHidesSidecars(t *testing.T) {
 	ctx := context.Background()
 	rawDir := t.TempDir()
 	writeFile(t, filepath.Join(rawDir, "a.txt"), "hello")
-	writeFile(t, filepath.Join(rawDir, "a.txt"+defaultSuffix), `{"v":1,"mode":"0700"}`)
-	writeFile(t, filepath.Join(rawDir, "orphan"+defaultSuffix), `{"v":1,"mode":"0700"}`)
+	writeFile(t, filepath.Join(rawDir, sidecarRel("a.txt")), `{"v":1,"mode":"0700"}`)
+	writeFile(t, filepath.Join(rawDir, sidecarRel("orphan")), `{"v":1,"mode":"0700"}`)
 
 	f := newTestFs(t, rawDir, nil)
 
@@ -454,12 +466,12 @@ func TestListHidesSidecars(t *testing.T) {
 		t.Fatalf("List did not return a.txt: %v", names)
 	}
 	for name := range names {
-		if strings.HasSuffix(name, defaultSuffix) {
+		if isTestSidecar(name) {
 			t.Fatalf("List leaked sidecar %q", name)
 		}
 	}
 
-	if _, err := f.NewObject(ctx, "a.txt"+defaultSuffix); !errors.Is(err, fs.ErrorObjectNotFound) {
+	if _, err := f.NewObject(ctx, sidecarRel("a.txt")); !errors.Is(err, fs.ErrorObjectNotFound) {
 		t.Fatalf("NewObject on sidecar = %v, want fs.ErrorObjectNotFound", err)
 	}
 }
@@ -468,7 +480,7 @@ func TestListWithHideSidecarsDisabled(t *testing.T) {
 	ctx := context.Background()
 	rawDir := t.TempDir()
 	writeFile(t, filepath.Join(rawDir, "a.txt"), "hello")
-	writeFile(t, filepath.Join(rawDir, "a.txt"+defaultSuffix), `{"v":1,"mode":"0700"}`)
+	writeFile(t, filepath.Join(rawDir, sidecarRel("a.txt")), `{"v":1,"mode":"0700"}`)
 
 	f := newTestFs(t, rawDir, map[string]string{"hide_sidecars": "false"})
 
@@ -478,14 +490,14 @@ func TestListWithHideSidecarsDisabled(t *testing.T) {
 	}
 	found := false
 	for _, entry := range entries {
-		if entry.Remote() == "a.txt"+defaultSuffix {
+		if entry.Remote() == sidecarRel("a.txt") {
 			found = true
 		}
 	}
 	if !found {
 		t.Fatal("sidecar should be listed when hide_sidecars=false")
 	}
-	if _, err := f.NewObject(ctx, "a.txt"+defaultSuffix); err != nil {
+	if _, err := f.NewObject(ctx, sidecarRel("a.txt")); err != nil {
 		t.Fatalf("NewObject on sidecar with hide_sidecars=false: %v", err)
 	}
 }
@@ -499,7 +511,7 @@ func TestFlushAllPendingWritesSidecar(t *testing.T) {
 	// A very long debounce proves the sidecar is still in memory until the
 	// explicit flush, which is what CleanUp/unmount relies on.
 	f := newTestFs(t, rawDir, map[string]string{"writeback_delay": "1h"})
-	sidecarPath := filepath.Join(rawDir, "d", "x.txt"+defaultSuffix)
+	sidecarPath := filepath.Join(rawDir, sidecarRel("d/x.txt"))
 
 	if err := f.scheduleSidecarUpdate(ctx, "d/x.txt", &sidecarData{
 		Version: sidecarSchemaVersion,
@@ -535,7 +547,7 @@ func TestScheduleNilDeletesSidecar(t *testing.T) {
 	if err := f.scheduleSidecarUpdate(ctx, "x.txt", nil); err != nil {
 		t.Fatalf("scheduleSidecarUpdate(nil): %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(rawDir, "x.txt"+defaultSuffix)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(rawDir, sidecarRel("x.txt"))); !os.IsNotExist(err) {
 		t.Fatalf("sidecar must be deleted when scheduling nil (stat err=%v)", err)
 	}
 }
@@ -557,7 +569,7 @@ func TestMoveMovesSidecar(t *testing.T) {
 	if _, err := f.Move(ctx, obj, "g.txt"); err != nil {
 		t.Fatalf("Move: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(rawDir, "f.txt"+defaultSuffix)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(rawDir, sidecarRel("f.txt"))); !os.IsNotExist(err) {
 		t.Fatalf("source sidecar must be moved away (stat err=%v)", err)
 	}
 	sc := readSidecar(t, rawDir, "g.txt")
@@ -582,7 +594,7 @@ func TestDirMoveMovesDirectorySidecar(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(rawDir, "d2", "f.txt")); err != nil {
 		t.Fatalf("directory content missing after DirMove: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(rawDir, "d1"+defaultSuffix)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(rawDir, sidecarRel("d1"))); !os.IsNotExist(err) {
 		t.Fatalf("source directory sidecar must be moved away (stat err=%v)", err)
 	}
 	sc := readSidecar(t, rawDir, "d2")
@@ -626,7 +638,7 @@ func TestRmdirRemovesDirectorySidecar(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(rawDir, "d")); !os.IsNotExist(err) {
 		t.Fatalf("directory still exists (stat err=%v)", err)
 	}
-	if _, err := os.Stat(filepath.Join(rawDir, "d"+defaultSuffix)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(rawDir, sidecarRel("d"))); !os.IsNotExist(err) {
 		t.Fatalf("directory sidecar still exists (stat err=%v)", err)
 	}
 }
@@ -693,7 +705,7 @@ func TestRmdirAtRootRemovesSidecarOutsideRoot(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(rawDir, "d")); !os.IsNotExist(err) {
 		t.Fatalf("root directory still exists (stat err=%v)", err)
 	}
-	if _, err := os.Stat(filepath.Join(rawDir, "d"+defaultSuffix)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(rawDir, sidecarRel("d"))); !os.IsNotExist(err) {
 		t.Fatalf("root directory sidecar still exists (stat err=%v)", err)
 	}
 }
@@ -775,7 +787,7 @@ func TestCacheDropsExpiredEntriesOnAccess(t *testing.T) {
 	if _, err := f.getSidecarAbs(ctx, "e.txt"); err != nil {
 		t.Fatalf("getSidecarAbs: %v", err)
 	}
-	if err := os.Remove(filepath.Join(rawDir, "e.txt"+defaultSuffix)); err != nil {
+	if err := os.Remove(filepath.Join(rawDir, sidecarRel("e.txt"))); err != nil {
 		t.Fatalf("Remove sidecar: %v", err)
 	}
 	time.Sleep(25 * time.Millisecond)
@@ -842,7 +854,7 @@ func TestPurgeAtRootRemovesSidecarOutsideRoot(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(rawDir, "d")); !os.IsNotExist(err) {
 		t.Fatalf("root directory still exists (stat err=%v)", err)
 	}
-	if _, err := os.Stat(filepath.Join(rawDir, "d"+defaultSuffix)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(rawDir, sidecarRel("d"))); !os.IsNotExist(err) {
 		t.Fatalf("root directory sidecar still exists (stat err=%v)", err)
 	}
 }
